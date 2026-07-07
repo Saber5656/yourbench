@@ -465,11 +465,14 @@ class Provider(Protocol):
 
 ### 6.4 Registry (`providers/__init__.py`)
 
-`PROVIDERS: dict[str, type]` mapping the config `provider` string to the
-adapter class; `build(model_cfg: ModelConfig, settings: Settings) -> Provider`
-resolves the API key env var (raising `ProviderError(kind=auth)` with the env
-var *name* in the message if required-but-unset) and constructs the adapter
-with a shared-per-call `httpx.AsyncClient` policy (§6.8).
+`PROVIDER_SPECS: dict[str, tuple[str, str]]` maps the config `provider`
+string to `(module_path, class_name)`, resolved lazily via
+`importlib.import_module` inside `build()` (avoids importing network
+adapters until needed). `build(model_cfg: ModelConfig, settings: Settings)
+-> Provider` resolves the API key env var (raising
+`ProviderError(kind=auth)` with the env var *name* in the message if
+required-but-unset) and constructs the adapter, whose transport comes from
+`providers.base.default_client(settings)` (§6.8).
 
 ### 6.5 `openai_compat` adapter
 
@@ -531,7 +534,7 @@ async def execute_run(
     model_ids: list[str],              # engine validation is authoritative (≥2 after dedup,
                                        # known+enabled, task not archived); callers may
                                        # pre-validate for friendlier messages
-    param_overrides: dict | None = None,
+    param_overrides: TaskParams | None = None,               # from mybench.db.tasks; None fields = no override
     progress: Callable[[OutputEvent], None] | None = None,   # CLI progress lines
     on_created: Callable[[int], None] | None = None,         # fired with run_id right after rows exist (web §11.6)
 ) -> RunSummary                        # (run_id, succeeded, failed, latency stats)
@@ -857,11 +860,14 @@ config and prints `ok: N models (M enabled)` or the validation error (exit 1).
 
 ### 11.1 App factory
 
-`web.app.create_app(config: Config, db_path: Path) -> FastAPI` — wires
-middleware (§13.3–13.5), routes, Jinja environment (autoescape on,
-`templates/` via package resources), static files at `/static`, startup hook
-(migrations + orphan sweep), and `runs_manager`. `serve_cmd` builds the app
-and runs uvicorn programmatically.
+`web.app.create_app(config: Config, db_path: Path, *, testing: bool =
+False) -> FastAPI` — wires middleware (§13.3–13.5), routes, Jinja
+environment (autoescape on, `templates/` via package resources), static
+files at `/static`, startup hook (migrations + orphan sweep), and
+`runs_manager` (§11.6). `testing=True` additionally mounts probe routes
+used only by the test suite (§13.4 CSRF probe, 500-handler probe); they are
+never mounted in normal serving. `serve_cmd` builds the app and runs
+uvicorn programmatically.
 
 ### 11.2 Route table (all HTML unless noted)
 
@@ -911,7 +917,11 @@ inline script/style) + `dashboard.html`, `tasks_list.html`, `task_form.html`,
 
 ### 11.5 Run detail blindness rules (see §8.5)
 
-While any unvoted pair exists **and** `revealed_at IS NULL`:
+While `status = 'running'`, the page shows the per-model status table only —
+no output content at all (cards appear only once the run is completed).
+
+For completed runs, while any unvoted pair exists **and** `revealed_at IS
+NULL`:
 
 - show per-model rows: **model_id, status, latency, tokens, error only** (no
   content, no provider/base_url/raw_model — those identify outputs when read
@@ -1008,8 +1018,10 @@ port. Applies to every route including static and JSON.
   the cookie value.
 - POST handlers require cookie presence and
   `hmac.compare_digest(cookie, form_field)`; mismatch/absence → 403.
-- If an `Origin` header is present it must match `http://{allowed host}:{port}`
-  exactly, else 403 (absent Origin is acceptable: token still required).
+- If an `Origin` header is present it must be a member of
+  `allowed_origins = {"http://127.0.0.1:{port}", "http://localhost:{port}",
+  "http://[::1]:{port}"}`, else 403 (absent Origin is acceptable: the token
+  is still required).
 
 ### 13.5 Response headers (every response, incl. errors/static)
 

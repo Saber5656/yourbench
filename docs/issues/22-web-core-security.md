@@ -30,7 +30,8 @@ must be complete and tested before pages exist.
 
 ## Detailed Requirements
 
-1. `create_app(config: Config, db_path: Path) -> FastAPI` (DESIGN §11.1):
+1. `create_app(config: Config, db_path: Path, *, testing: bool = False)
+   -> FastAPI` (DESIGN §11.1):
    - The Host allowlist and CSRF Origin check derive from
      `config.settings.port` — **`serve_cmd` resolves `--port` into an
      effective config before calling the factory**
@@ -48,9 +49,13 @@ must be complete and tested before pages exist.
      connection per request, closed after response (FastAPI dependency with
      `yield`).
    - Jinja2 env: loader from package resources
-     (`jinja2.PackageLoader("mybench.web", "templates")`), autoescape True,
-     `render(request, template, **ctx)` helper injecting `csrf_token` and
-     nav state into every context.
+     (`jinja2.PackageLoader("mybench.web", "templates")`), autoescape True.
+     Exported rendering helper (normative — page issues 24–29 build every
+     HTML response through it): `web.app.render(request: Request,
+     template_name: str, *, status_code: int = 200, **ctx) ->
+     HTMLResponse` — injects `csrf_token` (via `get_or_create_csrf_token`)
+     and nav state into the context and attaches the Set-Cookie header when
+     the token was newly generated.
    - Static mount `/static` from package resources; `Cache-Control:
      public, max-age=3600` for static, `no-store` for HTML (DESIGN §13.5).
    - Routers included from `web/routes/*` — this issue registers only `GET /`
@@ -84,13 +89,17 @@ must be complete and tested before pages exist.
        `from mybench.web.security import csrf_protect`. It returns 403
        unless: cookie exists, form field `csrf_token` exists, and
        `hmac.compare_digest(cookie, field)` passes; when an `Origin` header
-       is present it must equal `http://{allowed host}:{port}` exactly,
-       else 403.
-     - This issue registers a probe POST route `/_csrf_probe` using exactly
-       that pattern, mounted only when the factory is called with
-       `create_app(..., testing=True)` (keyword defaults to False), so the
-       mechanism is testable before any real POST route exists and never
-       ships in normal serving.
+       is present it must be in `allowed_origins =
+       frozenset({f"http://127.0.0.1:{port}", f"http://localhost:{port}",
+       f"http://[::1]:{port}"})` (DESIGN §13.4), else 403.
+     - Probe routes, mounted only under `create_app(..., testing=True)`
+       (DESIGN §11.1) so the mechanisms are testable before any real POST
+       route exists and never ship in normal serving:
+       | Method | Path | Behavior |
+       |---|---|---|
+       | GET | `/_csrf_probe` | renders a minimal page through `render()` containing one form with the hidden `csrf_token` |
+       | POST | `/_csrf_probe` | `dependencies=[Depends(csrf_protect)]`; returns text `probe ok` |
+       | GET | `/_raise_500` | raises `RuntimeError("probe")` (exercises the generic handler) |
 3. `base.html`: `<!doctype html>`, `<html lang="en">`, `<meta charset>`,
    viewport meta, `<title>{% block title %}mybench{% endblock %}</title>`,
    `<link rel="stylesheet" href="/static/app.css">`, nav links
@@ -120,9 +129,11 @@ must be complete and tested before pages exist.
 
 TestClient-based unless noted:
 
-- [ ] Host allowlist: `Host: localhost:{port}` etc. pass; `Host: evil.com`,
-      `Host: 127.0.0.1.evil.com`, `Host: 192.168.1.5:{port}` → 403 (incl. on
-      `/static/app.css`).
+- [ ] Host allowlist accepts exactly the six values `127.0.0.1`,
+      `127.0.0.1:{port}`, `localhost`, `localhost:{port}`, `[::1]`,
+      `[::1]:{port}` (each tested); rejects `evil.com`,
+      `127.0.0.1.evil.com`, `192.168.1.5:{port}`, `localhost:{other_port}`
+      → 403 (incl. on `/static/app.css`).
 - [ ] Header set golden-asserted on: 200 HTML, 404, 403, static (CSP/nosniff/
       frame/referrer on all; no-store on HTML only).
 - [ ] CSRF via the `/_csrf_probe` route: first HTML GET sets the cookie and
@@ -131,9 +142,10 @@ TestClient-based unless noted:
       / without field / mismatched → 403 (probe handler not executed);
       matching → 200; `Origin: http://localhost:{port}` passes;
       `Origin: https://evil.com` → 403 even with valid token.
-- [ ] 500 handling: a probe route raising `RuntimeError` (testing=True) with
+- [ ] 500 handling: `GET /_raise_500` (testing=True) with
       `TestClient(app, raise_server_exceptions=False)` → status 500,
-      `error.html` body without `Traceback`, full §13.5 headers present.
+      `error.html` body without `Traceback`, full §13.5 headers present;
+      the probe routes are absent (404) when `testing=False`.
 - [ ] Startup applies migrations + orphan sweep on a fresh tmp DB (sweep
       spy: the issue-08 function is called, not a local copy).
 - [ ] Port override: app built for `--port 9000` accepts
@@ -141,9 +153,14 @@ TestClient-based unless noted:
 - [ ] base.html has no `style=`/`onclick=`/`<script>` without `src` (assert
       via template source scan in a test); `tests/helpers.py::
       assert_secure_response` implemented and self-tested.
-- [ ] `serve` order verified via monkeypatched seams: redaction installed
-      before `create_app`; uvicorn called with host 127.0.0.1, workers=1,
-      resolved port (real-bind smoke lives in issue 30).
+- [ ] `serve` flow verified by monkeypatching exactly
+      `mybench.safety.install_redaction_filter`,
+      `mybench.web.app.create_app`, and `uvicorn.run`: call order is
+      redaction → create_app → uvicorn.run; create_app receives the
+      effective config with the resolved port; uvicorn receives host
+      `127.0.0.1`, `workers=1`, the resolved port (real-bind smoke lives in
+      issue 30). `serve` consumes the issue-16 `CliContext` (config already
+      loaded) rather than re-loading config itself.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation

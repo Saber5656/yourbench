@@ -39,7 +39,7 @@ DESIGN.md; no DESIGN.md v1 behavior is missing from issues (coverage table §5).
 | 07 | `issues/07-tasks-repository.md` | Tasks repository | 1 | 05, 06 |
 | 08 | `issues/08-runs-outputs-repository.md` | Runs/outputs repository incl. reveal + orphan sweep | 1 | 05 |
 | 09 | `issues/09-votes-repository-pair-selection.md` | Votes repository, pair selection, games extraction | 1 | 05, 07, 08 |
-| 10 | `issues/10-provider-interface-fake.md` | Provider interface, error taxonomy, registry, fake provider | 2 | 04 |
+| 10 | `issues/10-provider-interface-fake.md` | Provider interface, error taxonomy, registry, fake provider | 2 | 04, 06 |
 | 11 | `issues/11-openai-compat-provider.md` | OpenAI-compatible provider adapter | 2 | 10 |
 | 12 | `issues/12-anthropic-provider.md` | Anthropic provider adapter | 2 | 10 |
 | 13 | `issues/13-run-engine.md` | Run execution engine | 2 | 04, 06, 08, 10 |
@@ -93,7 +93,7 @@ flowchart LR
     I01 --> I02 & I03 & I04 & I05 & I06 & I14 & I23
     I03 --> I04 & I05
     I05 --> I07 & I08 & I09
-    I06 --> I07 & I13 & I16 & I22
+    I06 --> I07 & I10 & I13 & I16 & I22
     I07 --> I09 & I18 & I20 & I25
     I08 --> I09 & I13 & I20 & I22 & I25 & I26 & I29
     I09 --> I14 & I15 & I20 & I24 & I26 & I27 & I29

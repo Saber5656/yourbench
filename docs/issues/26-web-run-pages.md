@@ -19,9 +19,17 @@ until reveal conditions are met.
 
 - `src/mybench/web/runs_manager.py`
 - `src/mybench/web/routes/runs.py`
+- `src/mybench/web/app.py` (wiring only: instantiate `RunsManager` into
+  `app.state.runs_manager` — replacing issue 22's None placeholder — and
+  register `runs_manager.shutdown()` on app shutdown; routes access it via
+  `request.app.state.runs_manager`)
 - `src/mybench/web/templates/run_detail.html`
 - `src/mybench/web/static/runstatus.js`
 - `tests/test_web_runs.py`
+
+Gated/slow providers used in tests are **test-local fixtures** in
+`tests/test_web_runs.py` implementing the `Provider` protocol —
+`providers/fake.py` stays deterministic and unchanged (DESIGN §6.7).
 
 ## Detailed Requirements
 
@@ -47,8 +55,13 @@ until reveal conditions are met.
    - Each `_execute` uses its **own** DB connection (thread=event loop; no
      sharing with request connections).
 2. `POST /tasks/{id}/runs` (CSRF): form per issue 25 (`models` multi-value,
-   override fields); < 2 selected / archived / unknown → 400 re-render of
-   task detail with banner; success → 303 `/runs/{run_id}`.
+   override fields parsed with issue 25's normalization rules into a
+   `TaskParams`). Status split (DESIGN §11.2): malformed `{id}` → 400;
+   unknown task id → 404; form-level failures → 400 re-render of task
+   detail with a banner carrying exactly one of: `select at least 2
+   models`, `unknown or disabled model: {id}`, `task is archived`, or the
+   issue-06 validator messages for bad overrides. Success → 303
+   `/runs/{run_id}`.
 3. `GET /runs/{id}` — `run_detail.html` per DESIGN §11.5, four visual
    states. **Pre-reveal leak rule (§11.5): the status table shows model_id,
    status, latency, tokens, error ONLY — provider, base_url, raw_model, and
@@ -60,14 +73,17 @@ until reveal conditions are met.
    - **Completed, not votable** (< 2 succeeded): status table + banner
      exactly `not votable: fewer than 2 outputs succeeded` (DESIGN §7.3 /
      §11.5), no vote link, no cards.
-   - **Completed & blind** (unvoted pairs remain, `revealed_at` NULL):
+   - **Completed & blind** (`votes.unvoted_pair_count(conn, run_id=id) > 0`
+     — scoped to THIS run, DESIGN §8.5 — and `revealed_at` NULL):
      status table + anonymized output cards labeled `Output {output_id}`
      ordered by output id, content via `markdown_safe` + raw `<details>`
      (escaped); `Vote on this run` link → `/vote?run={id}`; reveal form
      (`POST /runs/{id}/reveal`, CSRF) with the §11.5 warning text.
-   - **Revealed** (`revealed_at` set, or auto: no unvoted pair remains):
-     cards show model names + latency/tokens; if auto-condition met and
-     `revealed_at` NULL → call `runs.reveal` during GET handling (idempotent).
+   - **Revealed** (`revealed_at` set, or auto: the run-scoped unvoted count
+     is 0): cards show model names + latency/tokens; if auto-condition met
+     and `revealed_at` NULL → call `runs.reveal` during GET handling
+     (idempotent).
+   - Unknown run id → 404; malformed id → 400 (DESIGN §11.2).
    - Truncation flag: outputs whose finish_reason ∈ {`length`,`max_tokens`}
      get a visible `truncated` badge (DESIGN §6.1).
    - Failed outputs: error text via `escape_pre`, never markdown (§12).
@@ -99,8 +115,12 @@ TestClient (+ manual async control via fake providers with event gates):
       order; vote link present.
 - [ ] Not-votable state: 1-of-3-succeeded fixture shows the exact banner,
       no vote link, no cards.
-- [ ] Auto-reveal: fixture with all pairs voted → GET flips `revealed_at`,
-      cards show model names; second GET stable.
+- [ ] Auto-reveal: fixture with all pairs of THIS run voted → GET flips
+      `revealed_at`, cards show model names; second GET stable; a second
+      run with unvoted pairs in the same DB does NOT block the reveal
+      (run-scoped count proven).
+- [ ] Status split: malformed id → 400; unknown id → 404 (GET detail,
+      status.json, and reveal POST each).
 - [ ] Manual reveal POST → non-blind warning honored (subsequent votes get
       blind=0 — cross-check via issue 09 semantics in an integration test).
 - [ ] Running state: content absent entirely; noscript refresh present only
@@ -110,7 +130,9 @@ TestClient (+ manual async control via fake providers with event gates):
 - [ ] RunsManager: exception inside a run logged and task removed from
       registry; shutdown cancels a gated run without hanging (≤ 3 s).
 - [ ] `tests.helpers.assert_secure_response` passes on the run detail page
-      in all four states.
+      in all four states, on `status.json` (`html=False` — §13.5 headers on
+      JSON too), and on `/static/runstatus.js`; hostile `Host` → 403 on the
+      two new routes.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation

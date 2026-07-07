@@ -35,11 +35,15 @@ demoable without keys or network (ADR-004).
    `ProviderError.from_status(status_code, message)` implementing the §6.5
    mapping (401/403→auth, 429→rate_limit, ≥500→api_error retryable, other
    4xx→api_error non-retryable).
-2. Message hygiene: `ProviderError` messages must pass through
-   `safety.strip_terminal_controls` and `safety.truncate(_, 300)` in the
-   constructor (defense against hostile error bodies; §13.1 B4). Note: the
-   constructor cannot know API keys — network adapters (11/12) must scrub
-   the resolved key from provider-derived text *before* raising (§6.2).
+2. Message hygiene: the `ProviderError` constructor sanitizes **before**
+   calling `super().__init__` — `sanitized =
+   safety.truncate(safety.strip_terminal_controls(message), 300)`, then
+   `super().__init__(sanitized)` and `self.message = sanitized`; the
+   original string is not stored anywhere (`err.args == (sanitized,)` —
+   defense against hostile error bodies leaking via repr/args; §13.1 B4).
+   Note: the constructor cannot know API keys — network adapters (11/12)
+   must scrub the resolved key from provider-derived text *before* raising
+   (§6.2).
 3. `base.py` also provides the shared transport factory (DESIGN §6.8):
    `default_client(settings: Settings) -> httpx.AsyncClient` — `verify=True`,
    `follow_redirects=False`, `timeout=httpx.Timeout(connect=10.0,
@@ -47,14 +51,16 @@ demoable without keys or network (ADR-004).
    must build their client through it (enforcement of caps/retries stays in
    the adapters).
 4. `__init__.py`:
-   - `build(model_cfg: ModelConfig, settings: Settings) -> Provider` resolves
-     the adapter class lazily by provider key:
-     `{"openai_compat": ("mybench.providers.openai_compat",
+   - Public registry (DESIGN §6.4): `PROVIDER_SPECS: dict[str, tuple[str,
+     str]]` = `{"openai_compat": ("mybench.providers.openai_compat",
      "OpenAICompatProvider"), "anthropic": ("mybench.providers.anthropic",
      "AnthropicProvider"), "fake": ("mybench.providers.fake",
-     "FakeProvider")}` via `importlib.import_module` + `getattr`. While
-     issues 11/12 have not landed, those modules are the issue-01 docstring
-     placeholders and `getattr` fails → re-raise as
+     "FakeProvider")}`.
+   - `build(model_cfg: ModelConfig, settings: Settings) -> Provider`
+     resolves the adapter class lazily from `PROVIDER_SPECS` via
+     `importlib.import_module` + `getattr`. While issues 11/12 have not
+     landed, those modules are the issue-01 docstring placeholders and
+     `getattr` fails → re-raise as
      `NotImplementedError(f"provider '{key}' not implemented yet")`. Do not
      create placeholder classes in their files.
    - Key requirement predicate (from DESIGN §5.3, restated):
@@ -69,10 +75,19 @@ demoable without keys or network (ADR-004).
    slug — `model_cfg.model` may be None for fake, ADR-004): content
    `f"fake output from {model_id} for prompt sha256:{h12}\n\n{FILLER}"` where
    `h12` = first 12 hex chars of SHA-256 of `user_prompt` (UTF-8) and
-   `FILLER` is a fixed two-paragraph markdown constant (must include a code
-   block and a list, for render testing); `finish_reason="stop"`;
+
+   ```python
+   FILLER = (
+       "This is deterministic fake output for testing.\n\n"
+       "- point one\n- point two\n\n"
+       "```python\nprint(\"hello from fake\")\n```\n"
+   )
+   ```
+
+   (exact constant, normative); `finish_reason="stop"`;
    `prompt_tokens=len(user_prompt)//4`, `completion_tokens=128`,
-   `latency_ms=1`, `raw_model=f"fake/{model_cfg.id}"`. `check()` → ok, 1 ms.
+   `latency_ms=1`, `raw_model=f"fake/{model_cfg.id}"`.
+   `check()` → `CheckResult(ok=True, message="ok (1 ms)", latency_ms=1)`.
    `aclose()` is a no-op. No I/O, no randomness.
 6. mypy-strict clean (protocol conformance of fake verified by a typed
    assignment in tests).
@@ -86,9 +101,13 @@ demoable without keys or network (ADR-004).
       and truncated.
 - [ ] Key-requirement predicate table-tested: anthropic (required), remote
       openai_compat (required), loopback openai_compat (optional → None ok),
-      fake (never). With `MYBENCH_CANARY_SECRET=sk-canary` set and the
-      required var unset, the auth error names the required var and contains
-      neither `sk-canary` nor any env value.
+      fake (never). Canary matrix: with monkeypatched env
+      `{"MYBENCH_CANARY_A": "sk-canary-a", "MYBENCH_CANARY_B":
+      "sk-canary-b"}` and the required var unset, the auth error message
+      contains the required var's name and contains neither canary value.
+- [ ] `ProviderError` sanitization happens before `super().__init__`:
+      for a hostile 10k-char ANSI-laden input, `err.args == (sanitized,)`
+      and `repr(err)` contains no `\x1b`.
 - [ ] `build` returns a working `FakeProvider` for a fake ModelConfig;
       `build` for `openai_compat`/`anthropic` against the issue-01
       placeholders raises `NotImplementedError` naming the provider.
@@ -113,7 +132,8 @@ Targeted checks:
 
 ## Dependencies
 
-04 (ModelConfig/Settings), 06 (safety).
+04 (ModelConfig/Settings), 06 (safety strip/truncate in the error
+constructor).
 
 ## Non-goals
 
