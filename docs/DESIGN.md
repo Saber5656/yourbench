@@ -73,6 +73,9 @@ Naming: product, repo, PyPI package, and CLI are all `mybench` (ADR-001).
 - No multi-turn conversations, attachments, images, or tool calls.
 - No cost (money) estimation — token counts are stored, pricing tables are not.
 - No import of exported data (export is one-way in v1).
+- No task editing or hard deletion: tasks are archive-only once created,
+  because runs/votes reference their exact prompt text (edit = archive +
+  recreate).
 - No Windows support commitment (POSIX: macOS/Linux; Windows untested).
 
 ### 2.3 v2 deferred ideas (recorded, not designed)
@@ -472,6 +475,7 @@ async def execute_run(
     model_ids: list[str],              # ≥2, all enabled, deduplicated, validated by caller message-level
     param_overrides: dict | None = None,
     progress: Callable[[OutputEvent], None] | None = None,   # CLI progress lines
+    on_created: Callable[[int], None] | None = None,         # fired with run_id right after rows exist (web §11.6)
 ) -> RunSummary                        # (run_id, succeeded, failed, latency stats)
 ```
 
@@ -592,11 +596,13 @@ shown pre-vote (they can fingerprint models).
 ### 9.1 Input: games
 
 `votes.games()` returns one game per vote:
-`Game(model_lo: str, model_hi: str, score_lo: float)` where `score_lo` ∈
+`Game(model_lo: str, model_hi: str, score_lo: float,
+kind: Literal["decisive", "tie", "both_bad"])` where `score_lo` ∈
 {1.0, 0.0, 0.5} from the winner field mapped through display order (`a`
-means "left output's model", so join votes → outputs → model_id). Default
-`blind=1` only; `include_nonblind=True` adds the rest. Category filter joins
-via run → task.
+means "left output's model", so join votes → outputs → model_id) and `kind`
+distinguishes tie from both_bad for display rates (§9.6) while both count 0.5
+for fitting. Default `blind=1` only; `include_nonblind=True` adds the rest.
+Category filter joins via run → task.
 
 ### 9.2 Estimator (`rating/bradley_terry.py`)
 
@@ -664,9 +670,11 @@ class LeaderboardRow:
     component: int      # 0-based; single component → all 0
 
 def compute_leaderboard(conn, *, category=None, include_nonblind=False,
-                        bootstrap_samples=200, seed=None) -> Leaderboard
+                        bootstrap_samples=200, seed=None,
+                        known_model_ids: Sequence[str] | None = None) -> Leaderboard
     # Leaderboard(rows sorted by rating desc within component, components_count,
-    #             unrated_models: list[str] with 0 games, total_votes)
+    #             unrated_models: list[str] with 0 games (from known_model_ids,
+    #             which callers fill with configured model ids), total_votes)
 ```
 
 No caching in v1: recompute per request (ADR-003). CLI and web both call this.
