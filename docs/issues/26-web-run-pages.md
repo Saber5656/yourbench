@@ -26,17 +26,19 @@ until reveal conditions are met.
 ## Detailed Requirements
 
 1. `RunsManager` (DESIGN §11.6):
-   - `__init__(config, db_path)`; `async start(task_id, model_ids,
-     overrides) -> int`: opens its own connection, validates via the runner's
-     rules (bad input → `ValueError` propagates to the route → 400
-     re-render), schedules `asyncio.create_task(self._execute(...))`, and
-     returns the run_id **after** the run rows exist (so the page can render
+   - `__init__(config, db_path)`; `async start(task: Task, model_ids:
+     list[str], overrides: TaskParams | None) -> int` (signature per DESIGN
+     §11.6 — the **route** loads the `Task`, checks it exists/not archived,
+     and resolves/dedupes model ids for friendly 400s; the engine
+     re-validates authoritatively per §7.1): opens its own connection,
+     schedules `asyncio.create_task(self._execute(...))`, and returns the
+     run_id **after** the run rows exist (so the page can render
      immediately). Mechanism: `_execute` calls `execute_run(...)` and the
      manager obtains the id via the engine's `on_created` callback
      (DESIGN §7.1, implemented in issue 13), awaited through an
-     `asyncio.Future` resolved by the callback; validation `ValueError`s
-     raised before `on_created` fires must reject that Future so `start()`
-     re-raises them synchronously to the route.
+     `asyncio.Future` resolved by the callback; engine `ValueError`s raised
+     before `on_created` fires must reject that Future so `start()`
+     re-raises them to the route (→ 400 re-render of the task page).
    - Tracks `self._tasks: dict[int, asyncio.Task]`; done-callback pops the
      entry and logs exceptions at ERROR.
    - `shutdown()`: cancel outstanding tasks (awaited, best-effort);
@@ -47,18 +49,22 @@ until reveal conditions are met.
 2. `POST /tasks/{id}/runs` (CSRF): form per issue 25 (`models` multi-value,
    override fields); < 2 selected / archived / unknown → 400 re-render of
    task detail with banner; success → 303 `/runs/{run_id}`.
-3. `GET /runs/{id}` — `run_detail.html` per DESIGN §11.5, three visual states:
-   - **Running**: per-model status table (model_id, status, latency, tokens,
-     error — model names WITH status is allowed; content is NOT shown while
-     running), auto-refresh via `runstatus.js` (+ `<noscript><meta
-     http-equiv="refresh" content="5"></noscript>` fallback emitted only
-     while running).
+3. `GET /runs/{id}` — `run_detail.html` per DESIGN §11.5, four visual
+   states. **Pre-reveal leak rule (§11.5): the status table shows model_id,
+   status, latency, tokens, error ONLY — provider, base_url, raw_model, and
+   snapshot fields appear NOWHERE on the pre-reveal page, and output ids do
+   not appear in the status table** (they would map rows to cards):
+   - **Running**: the status table, no content anywhere; auto-refresh via
+     `runstatus.js` (+ `<noscript><meta http-equiv="refresh" content="5">
+     </noscript>` fallback emitted only while running).
+   - **Completed, not votable** (< 2 succeeded): status table + banner
+     exactly `not votable: fewer than 2 outputs succeeded` (DESIGN §7.3 /
+     §11.5), no vote link, no cards.
    - **Completed & blind** (unvoted pairs remain, `revealed_at` NULL):
-     model status table WITHOUT content mapping + anonymized output cards
-     labeled `Output {output_id}` ordered by output id, content via
-     `markdown_safe` + raw `<details>`; `Vote on this run` link →
-     `/vote?run={id}`; reveal form (`POST /runs/{id}/reveal`, CSRF) with the
-     §11.5 warning text.
+     status table + anonymized output cards labeled `Output {output_id}`
+     ordered by output id, content via `markdown_safe` + raw `<details>`
+     (escaped); `Vote on this run` link → `/vote?run={id}`; reveal form
+     (`POST /runs/{id}/reveal`, CSRF) with the §11.5 warning text.
    - **Revealed** (`revealed_at` set, or auto: no unvoted pair remains):
      cards show model names + latency/tokens; if auto-condition met and
      `revealed_at` NULL → call `runs.reveal` during GET handling (idempotent).
@@ -67,8 +73,9 @@ until reveal conditions are met.
    - Failed outputs: error text via `escape_pre`, never markdown (§12).
 4. `GET /runs/{id}/status.json`: exactly
    `{"status": str, "pending": int, "succeeded": int, "failed": int,
-   "votable": bool}` via `runs.status_counts` — **no model names in the JSON**
-   (it is fetched pre-reveal; DESIGN §11.2).
+   "votable": bool}` via issue 08's `runs.status_counts` (`votable` =
+   completed and succeeded ≥ 2) — **no model ids in the JSON** (it is
+   fetched pre-reveal; DESIGN §11.2).
 5. `POST /runs/{id}/reveal` (CSRF): `runs.reveal`, 303 back.
 6. `runstatus.js`: vanilla JS, no globals leaked (IIFE), reads run id from
    `data-run-id` attribute, polls every 2 s while `status == "running"`,
@@ -80,13 +87,18 @@ until reveal conditions are met.
 TestClient (+ manual async control via fake providers with event gates):
 
 - [ ] POST run: 303 to run page; run + pending outputs exist immediately;
-      bad selections → 400 with banner, no rows.
+      bad selections → 400 with banner, no rows; POST without CSRF token /
+      with hostile Origin → 403 for BOTH `/tasks/{id}/runs` and
+      `/runs/{id}/reveal`, no state change.
 - [ ] status.json shape golden; never contains model ids (string assert on
-      raw body).
-- [ ] Blind state: page body does NOT contain any model id / provider /
-      base_url / raw_model string anywhere in output cards region — but DOES
-      contain them in the status table region; card order is output-id order;
-      vote link present.
+      raw body with distinctive fixture ids).
+- [ ] Pre-reveal leak test with distinctive fixture values: page body
+      contains model ids ONLY within the status table markup, and contains
+      the provider name, base_url host, and raw_model string NOWHERE; no
+      output id appears in the status table region; card order is output-id
+      order; vote link present.
+- [ ] Not-votable state: 1-of-3-succeeded fixture shows the exact banner,
+      no vote link, no cards.
 - [ ] Auto-reveal: fixture with all pairs voted → GET flips `revealed_at`,
       cards show model names; second GET stable.
 - [ ] Manual reveal POST → non-blind warning honored (subsequent votes get
@@ -97,16 +109,27 @@ TestClient (+ manual async control via fake providers with event gates):
       `finish_reason="length"` and `"max_tokens"`.
 - [ ] RunsManager: exception inside a run logged and task removed from
       registry; shutdown cancels a gated run without hanging (≤ 3 s).
+- [ ] `tests.helpers.assert_secure_response` passes on the run detail page
+      in all four states.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
 
-`uv run pytest tests/test_web_runs.py -q`; manual: trigger a fake-provider
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
+`uv run pytest tests/test_web_runs.py -q`; optional manual QA (non-gating): trigger a fake-provider
 run in the browser, watch polling, verify blind → vote → reveal cycle.
 
 ## Dependencies
 
-08, 13, 22, 23, 25 (form origin).
+08, 09 (`unvoted_pair_count` for reveal-state logic), 13, 22, 23, 25 (form
+origin).
 
 ## Non-goals
 

@@ -11,9 +11,10 @@ the `escape_pre()` helper for raw views, with an adversarial XSS test corpus.
 ## Context
 
 Model outputs are untrusted attacker-controlled content rendered into the
-user's browser — boundary B2 (DESIGN §12, §13.1). This function is the only
-sanctioned path from model/user text to HTML; every content page (25–29)
-imports it.
+user's browser — boundary B2 (DESIGN §12, §13.1). These helpers are the only
+sanctioned path from content bodies to HTML; the pages that render
+prompts/outputs (25, 26, 27) import them, and scalar metadata everywhere
+else relies on Jinja autoescape per the DESIGN §12 policy.
 
 ## Scope
 
@@ -62,14 +63,34 @@ from the output AND the benign remainder renders:
 - [ ] `<iframe>`, `<form>`, `<style>`, `<svg onload=...>` → stripped/escaped.
 - [ ] Code block containing `<script>` → rendered escaped **inside**
       `<pre><code>` (visible as text).
-- [ ] Table/list/heading markdown renders with allowed tags.
+- [ ] Heading/list/code/blockquote/emphasis markdown renders with allowed
+      tags (no pipe-table criterion: CommonMark does not render tables —
+      DESIGN §12; table tags stay allowlisted as defense-in-depth only).
 - [ ] Nested/malformed HTML fuzz strings (at least 5 hand-picked) never raise.
-- [ ] `escape_pre` escapes `<`, `>`, `&`, quotes.
-- [ ] Property: output of both functions never contains the substrings
-      `<script`, `onerror=`, `javascript:` for any corpus input.
-- [ ] ruff, mypy strict, pytest green (this module: ≥ 95% coverage per §15).
+- [ ] DOM-level assertions for `markdown_safe` (parse output with
+      `html.parser`, not substring checks): every tag ∈ `ALLOWED_TAGS`;
+      attributes only `href`/`rel` on `a`; every `href` scheme
+      (case-insensitive, after strip) ∈ {http, https, mailto}; every `a` has
+      the required `rel`.
+- [ ] Separate invariants per function (they differ by design):
+      `markdown_safe` output parses with no active content (per the DOM
+      assertions above) for every corpus input; `escape_pre(text)` equals
+      `markupsafe.escape(text)` exactly (a hostile `<img onerror=…>`
+      remains **visible as escaped text** — `&lt;img…` — which is correct),
+      returns `Markup`, and contains no raw `<` or `>` characters.
+- [ ] ruff, mypy strict, pytest green; `uv run coverage run -m pytest && uv
+      run coverage report --include='*/web/render.py'` shows ≥ 95% (the §15
+      gate for this module).
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_render.py -q`.
 

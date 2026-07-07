@@ -21,8 +21,10 @@ its job is orientation: what exists, what needs votes, where to go.
 ## Detailed Requirements
 
 1. Route `GET /` (replaces issue 22's placeholder):
-   - Stats row: active task count (`tasks.list_` non-archived), total runs,
-     total votes (blind + non-blind shown as `N (+M non-blind)` when M > 0),
+   - Stats row via repo APIs only (DESIGN §4.4): active task count
+     (`len(tasks.list_(conn))`), total runs (`runs.count(conn)`), votes via
+     `votes.counts(conn) -> (blind, nonblind)` rendered exactly as
+     `{blind}` when nonblind == 0 else `{blind} (+{nonblind} non-blind)`,
      and **unvoted pair count** via `votes.unvoted_pair_count(conn)`.
    - CTA block: when unvoted pairs > 0 → prominent link `Start voting
      ({n} pairs waiting)` → `/vote`; when 0 and tasks exist → link to
@@ -34,9 +36,10 @@ its job is orientation: what exists, what needs votes, where to go.
      task display title (control chars are impossible in HTML context but
      titles pass through Jinja autoescape; no markdown), status,
      `succeeded/total`, created date, link to `/runs/{id}`.
-2. Titles/categories rendered as plain autoescaped text (no `markdown_safe` —
-   dashboard shows no model output; keep this page free of issue 23 dep).
-3. All queries via existing repos; no SQL in the route.
+2. Titles/categories are scalar metadata → plain autoescaped text per the
+   DESIGN §12 policy (the dashboard renders no content bodies, so it does
+   not import `web.render`).
+3. All queries via the §4.4 repo APIs; no SQL in the route.
 4. mypy-strict clean.
 
 ## Acceptance Criteria
@@ -44,17 +47,27 @@ its job is orientation: what exists, what needs votes, where to go.
 TestClient with seeded fixture DB:
 
 - [ ] Counts correct for a fixture (3 tasks 1 archived, 2 runs, 5 votes 1
-      non-blind, 2 unvoted pairs) — assert rendered numbers.
+      non-blind, 2 unvoted pairs) — asserts the exact rendered strings `2`
+      (tasks), `2` (runs), `4 (+1 non-blind)` (votes), `2` (pairs); a
+      zero-non-blind fixture renders plain `4`.
 - [ ] CTA states: pairs-waiting / no-pairs-but-tasks / empty-onboarding each
       rendered (three fixtures).
 - [ ] Recent runs table rows link to run pages; limited to 5; newest first.
 - [ ] Task title containing `<b>evil</b>` appears escaped (source contains
       `&lt;b&gt;`).
-- [ ] Page passes the shared security assertions (headers present, no inline
-      script) — reuse issue 22's helper.
+- [ ] `tests.helpers.assert_secure_response(resp, html=True)` (issue 22's
+      shared helper) passes on the page.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_web_dashboard.py -q`; manual look at
 `http://127.0.0.1:8137/` with the fake-provider demo flow.

@@ -31,32 +31,49 @@ B5 (DESIGN §13.1, §13.7).
    - data dir: `$MYBENCH_DATA_DIR` → `$XDG_DATA_HOME/mybench` →
      `~/.local/share/mybench`.
    - `db_path() = data_dir() / "mybench.db"`.
-   - Empty-string env vars are treated as unset. Relative env paths are
-     resolved against CWD via `Path(...).expanduser().resolve()`.
+   - Env value normalization per DESIGN §5.1: empty-string env vars are
+     treated as unset (fall through to the next candidate); values are
+     normalized with `Path(v).expanduser().resolve(strict=False)`.
    - The same XDG rules apply on macOS (deliberate; DESIGN §5.1).
-3. `data_dir()` side effects: create the directory (parents included) with
-   mode `0700` when missing; when it exists with wider permissions than
-   `0700`, `chmod` it to `0700`. Return the path. `config_path()` has **no**
-   side effects (does not create the config dir; issue 16's `init` does).
+3. `data_dir()` side effects (DESIGN §5.1/§13.7): create the final directory
+   with mode `0700` (missing parents created as needed with default mode);
+   when the final directory exists with permissions wider than `0700`,
+   `chmod` **only the final directory** to `0700` — never chmod ancestors;
+   raise `NotADirectoryError` if the path exists and is not a directory.
+   Return the path. `config_path()` has **no** side effects (does not create
+   the config dir; issue 16's `init` does).
 4. No reads of the config file here (config layer is issue 04); module must
    not import `config.py` (no cycles).
 5. Type hints, mypy-strict clean.
 
 ## Acceptance Criteria
 
-- [ ] All resolution-order combinations covered by tests using
-      `monkeypatch.setenv/delenv` and `tmp_path` as fake `$HOME`
-      (`monkeypatch.setenv("HOME", ...)`).
-- [ ] Empty env var falls through to the next candidate (tested).
+- [ ] Resolution test matrix (each its own test, for both config and data
+      paths, using `monkeypatch.setenv/delenv` + `tmp_path` as fake `$HOME`):
+      (a) `MYBENCH_*` set → wins; (b) `MYBENCH_*` unset + `XDG_*` set → XDG;
+      (c) both unset → home fallback; (d) `MYBENCH_*` empty string → falls
+      through to XDG; (e) `XDG_*` empty string → falls through to home;
+      (f) relative `MYBENCH_*` path resolves against CWD; (g) `~/`-prefixed
+      value expands.
 - [ ] `data_dir()` creates missing dir with mode `0700` (assert
-      `stat.S_IMODE == 0o700`) and tightens an existing `0755` dir to `0700`.
+      `stat.S_IMODE == 0o700`), tightens an existing `0755` dir to `0700`,
+      leaves ancestor permissions untouched, and raises `NotADirectoryError`
+      when the path is a regular file.
 - [ ] `config_path()` never creates directories (tested).
 - [ ] `db_path()` is `data_dir()/mybench.db` (tested).
 - [ ] ruff, mypy strict, pytest all green.
 
 ## Validation
 
-`uv run pytest tests/test_paths.py -q`. Manual: `MYBENCH_DATA_DIR=/tmp/mbtest
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
+`uv run pytest tests/test_paths.py -q`. optional manual QA (non-gating): `MYBENCH_DATA_DIR=/tmp/mbtest
 uv run python -c "from mybench.paths import db_path; print(db_path())"`.
 
 ## Dependencies

@@ -34,21 +34,34 @@ validation rules via this module so limits can never drift apart.
      `\t`; also strips `\x7f` and C1 range `\x80–\x9f`.
    - Must be regex-based and total (never raises on any str input).
 3. `truncate(s: str, limit: int, marker: str = "…[truncated]") -> str` —
-   result length ≤ `limit` (marker included when truncation happened).
-4. `redact(s: str, secrets: Sequence[str]) -> str` — replaces each non-empty
-   secret value with `[REDACTED]`; longest-first replacement order.
+   result length ≤ `limit`; marker included when truncation happened; when
+   `limit <= len(marker)` return `marker[:limit]` (so `limit=0` → `""`).
+4. `redact(s: str, replacements: Sequence[tuple[str, str]]) -> str` —
+   replaces each `(secret_value, replacement)` pair (skip empty secrets),
+   applying longest secrets first (DESIGN §5.5).
 5. `install_redaction_filter(secret_env_vars: Sequence[str]) -> None`
-   (DESIGN §14): reads current values of the named env vars (skips
-   unset/empty), attaches a `logging.Filter` to the **root logger's handlers
-   and the `mybench` logger** that rewrites `record.getMessage()` output via
-   `redact` (implementation: set `record.msg = redact(record.getMessage(),
-   ...); record.args = None`). Idempotent (calling twice does not stack
-   duplicate filters — use a module-level marker attribute).
+   (DESIGN §5.5/§14): reads current values of the named env vars (skips
+   unset/empty) building pairs `(value, f"[REDACTED:{name}]")`, then wraps
+   the formatter of every root-logger handler in a `RedactingFormatter`
+   whose `format(record)` = `redact(inner.format(record), pairs)` — this
+   covers message, args, **and exception traceback text**. Handlers added
+   later are not covered (documented limitation; both entry points install
+   before other logging setup). Idempotent via an `_is_redacting` marker
+   attribute on wrapped formatters.
 6. `validate_task_params(*, user_prompt, system_prompt, title, category,
-   temperature, top_p, max_tokens) -> list[str]` — returns a list of
-   human-readable violations (empty = valid), applying §5.4 rules; `category`
-   `None` → treated as `"general"`. Callers (CLI issue 18, web issues 25/26)
-   render these messages verbatim.
+   temperature, top_p, max_tokens) -> list[str]` — returns human-readable
+   violations (empty = valid) applying the §5.4 **task** rules; `category`
+   `None` → treated as `"general"`. Exact messages (normative; callers
+   render verbatim, tests assert equality):
+   - `user_prompt: required` / `user_prompt: exceeds 200000 characters`
+   - `system_prompt: exceeds 50000 characters`
+   - `title: exceeds 200 characters`
+   - `category: must match [a-z0-9][a-z0-9-]{0,31}`
+   - `temperature: must be between 0 and 2`
+   - `top_p: must be between 0 and 1`
+   - `max_tokens: must be an integer between 1 and 128000`
+   Order: field order as listed above. The vote-`note` limit constant lives
+   here but is enforced by `votes.create` (issue 09), not by this function.
 7. Pure stdlib; mypy-strict clean.
 
 ## Acceptance Criteria
@@ -60,14 +73,27 @@ validation rules via this module so limits can never drift apart.
       through unchanged.
 - [ ] `redact` replaces multiple distinct secrets and overlapping cases
       (longer secret containing a shorter one) correctly.
-- [ ] Redaction filter: a logger call containing a fake key value emits
-      `[REDACTED]`; installing twice doesn't duplicate output or filters.
-- [ ] `validate_task_params` table-driven tests: at least one violation per
-      §5.4 rule and a fully-valid case returning `[]`.
-- [ ] `truncate` boundary cases (exact limit, limit < marker length).
+- [ ] Redaction formatter: with `FAKEKEY=sekret` configured, a log record
+      whose message contains `sekret` emits `[REDACTED:FAKEKEY]` and never
+      `sekret`; an exception logged via `logger.exception` whose traceback
+      text contains `sekret` is also redacted; installing twice doesn't
+      double-wrap (formatter count unchanged).
+- [ ] `validate_task_params` table-driven tests: each normative message of
+      requirement 6 asserted by exact string equality, plus a fully-valid
+      case returning `[]` and a multi-violation case preserving field order.
+- [ ] `truncate` boundary cases: exact limit (no marker), one-over,
+      `limit == len(marker)`, `limit < len(marker)`, `limit = 0`.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_safety.py -q`.
 

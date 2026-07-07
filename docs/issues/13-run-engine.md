@@ -41,18 +41,28 @@ votable.
      (prompt fields from task) → violations raise `ValueError`.
    - Snapshot JSON per model (DESIGN §4.3 outputs): compact JSON
      `{"provider","base_url","model","params":{...effective, omit None}}`.
-   - Create run + pending outputs via `runs.create_with_outputs`; fire
-     `on_created(run_id)` immediately after (the web runs manager, issue 26,
-     uses this to learn the id before execution finishes).
+   - Create run + pending outputs via `runs.create_with_outputs`; the
+     returned `Run.outputs` tuple (creation order = model order) is the
+     model→output-id mapping used for `finish_output` calls — no ad-hoc SQL
+     in the runner. Fire `on_created(run_id)` immediately after (the web
+     runs manager, issue 26, uses this to learn the id before execution
+     finishes).
    - Per model coroutine: `provider_factory(model_cfg, settings)` (errors
      from build, e.g. missing env var, are recorded as that output's
-     failure, not raised); `async with asyncio.timeout(
-     settings.timeout_seconds)` around `complete()`; success →
+     failure, not raised); build
+     `request = CompletionRequest(system_prompt=task.system_prompt,
+     user_prompt=task.user_prompt, temperature=eff.temperature,
+     top_p=eff.top_p, max_tokens=eff.max_tokens)` (from
+     `mybench.providers.base`); `async with asyncio.timeout(
+     settings.timeout_seconds)` around `await provider.complete(request)`;
+     `finally: await provider.aclose()`. Success →
      `runs.finish_output(succeeded, ...)`; `ProviderError` → failed with
-     `error=str(e)`; `TimeoutError` → failed `error="timeout: exceeded
-     {n}s"`; any other exception → failed
-     `error=f"internal: {type(e).__name__}"` (no traceback in DB; log it).
-     Fire `progress(event)` after each terminal transition. Close providers.
+     `error=e.message` (the sanitized contract field, §6.2 — not `str(e)`);
+     `TimeoutError` → failed `error=f"timeout: exceeded {n}s"`; any other
+     exception → failed `error=f"invalid_response: {type(e).__name__}"`
+     (DESIGN §7.2; no traceback in DB — traceback to DEBUG log via the
+     `mybench.runner` logger, redaction active). Fire `progress(event)`
+     after each terminal transition.
    - Concurrency: `asyncio.Semaphore(settings.max_concurrency)`;
      `asyncio.gather(..., return_exceptions=True)`; a coroutine bug surfacing
      as an exception must still leave its output terminal (wrap the whole
@@ -79,8 +89,9 @@ Tests use stub providers (no network, controllable delays/errors):
       message; faster models still succeed.
 - [ ] Provider build failure (missing env) → that output failed with the auth
       message; no exception escapes.
-- [ ] Unexpected exception in stub → output failed `internal: ...`; run
-      completes.
+- [ ] Unexpected exception in stub → output failed
+      `invalid_response: {ClassName}`; run completes; `aclose` called on
+      every provider including failing ones (spy assertion).
 - [ ] Semaphore honored: with max_concurrency=2 and 4 instrumented stubs,
       peak concurrent `complete()` calls == 2.
 - [ ] `on_created` fires with the run id after rows exist and before any
@@ -91,11 +102,19 @@ Tests use stub providers (no network, controllable delays/errors):
 
 ## Validation
 
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
 `uv run pytest tests/test_runner.py -q`.
 
 ## Dependencies
 
-04, 08, 10.
+04, 06, 08, 10.
 
 ## Non-goals
 

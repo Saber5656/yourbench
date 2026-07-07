@@ -32,34 +32,46 @@ vote validity (boundary B7).
      `kind` preserves the tie/both_bad distinction for display rates).
    - `VoteListItem`: `Vote` fields + `task_id`, `task_title`, `category`,
      `model_a: str`, `model_b: str`.
-2. `create(conn, *, run_id, output_a_id, output_b_id, winner, note,
-   now=None) -> Vote`:
+2. `create(conn, *, run_id, output_a_id, output_b_id, winner,
+   note: str | None = None, now: str | None = None) -> Vote` (DESIGN §4.4
+   normative signature; `now` in the §4.1 ISO-`Z` format, default
+   `utc_now_iso()`):
    - Integrity checks (each violation → `ValueError`): both outputs exist,
      belong to `run_id`, are distinct, both `succeeded`; `winner ∈
-     {'a','b','tie','both_bad'}`; `note` ≤ `safety.MAX_NOTE_CHARS`.
+     {'a','b','tie','both_bad'}`; `note` is `None` or ≤
+     `safety.MAX_NOTE_CHARS` chars (empty string stored as NULL).
    - `blind` is computed **inside** the same transaction: `1` if the run's
-     `revealed_at IS NULL` else `0` (caller does not pass it).
+     `revealed_at IS NULL` else `0` (caller never passes it — §8.5).
 3. `delete(conn, vote_id) -> bool` (False if missing).
 4. `next_pair(conn, *, category=None, task_id=None, run_id=None) ->
-   Pair | None` — implement exactly the normative SQL of DESIGN §8.3 with the
-   optional filters appended (`t.category = ?`, `t.id = ?`, `r.id = ?`).
+   Pair | None` — the normative SQL of DESIGN §8.3 amended only by adding
+   `t.id AS task_id` to the CTE select list and `p.task_id` to the outer
+   select (so `Pair.task_id` is populated), with the optional filters
+   appended inside the CTE (`AND t.category = ?`, `AND t.id = ?`,
+   `AND r.id = ?`).
 5. `unvoted_pair_count(conn, *, same filters) -> int` (§8.3).
 6. `list_votes(conn, *, limit=100) -> list[VoteListItem]` — newest first,
    joining model ids of both outputs (history page; models are revealed there
-   by design since the vote already happened).
+   by design since the vote already happened). `counts(conn) ->
+   tuple[int, int]` — (blind, non-blind) totals (dashboard, DESIGN §4.4).
 7. `games(conn, *, category=None, include_nonblind=False) -> list[Game]` —
    one game per vote (join votes→outputs→runs→tasks): map winner through
    display order to `score_lo` with models ordered lexically
    (`model_lo < model_hi`); `blind=1` only unless `include_nonblind`;
    excludes nothing else (archived tasks still count — votes are history).
-8. Parametrized SQL only; `votes` table touched only here.
+8. Parametrized SQL only. Writes to `votes` happen only in this module;
+   read-only joins elsewhere per the DESIGN §4.4 ownership rule (e.g.
+   `db.dump_all` for export).
 9. mypy-strict clean.
 
 ## Acceptance Criteria
 
 - [ ] `create` rejects: cross-run outputs, failed output, identical outputs,
-      bad winner, oversized note (each tested).
-- [ ] `blind` auto-set: vote before reveal → 1; after `runs.reveal` → 0.
+      bad winner, oversized note (limit+1); accepts note `None`, empty
+      (stored NULL), and exactly-at-limit (each tested).
+- [ ] `blind` auto-set: vote before reveal → 1; after `runs.reveal` → 0;
+      injected `now` round-trips into `created_at`.
+- [ ] `counts` returns correct (blind, non-blind) totals.
 - [ ] `next_pair` ordering: with pairs voted {0,0,1} times → returns one of
       the zero-vote pairs; after voting them once each, the once-voted pair
       becomes eligible (least-voted-first over 20 iterations never returns a
@@ -70,10 +82,19 @@ vote validity (boundary B7).
 - [ ] `games` mapping: fixture where left output belongs to lexically-larger
       model verifies the score flip; tie and both_bad both → 0.5 with `kind`
       set to `tie`/`both_bad` respectively; decisive votes → `kind="decisive"`;
-      blind filter verified.
+      blind filter verified; two-category fixture proves
+      `games(category=...)` returns only matching votes.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_votes_repo.py -q`.
 

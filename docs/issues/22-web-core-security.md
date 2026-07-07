@@ -19,16 +19,31 @@ must be complete and tested before pages exist.
 - `src/mybench/web/app.py`, `src/mybench/web/security.py`
 - `src/mybench/web/templates/base.html`, `error.html`
 - `src/mybench/web/static/app.css`
-- `src/mybench/cli/serve_cmd.py`
+- `src/mybench/cli/serve_cmd.py` (+ its `cli.add_command` line in
+  `cli/main.py`)
 - `tests/test_web_security.py`, `tests/test_serve_cmd.py`
+- `tests/helpers.py` — shared assertion helper
+  `assert_secure_response(response, *, html: bool)` used by every page
+  issue (24–29): asserts the full §13.5 header set, `Cache-Control:
+  no-store` iff html, and (for html) body contains no inline `<script>`
+  without `src`, no `<style>`, no `on*=` attributes, no `|safe` artifacts.
 
 ## Detailed Requirements
 
 1. `create_app(config: Config, db_path: Path) -> FastAPI` (DESIGN §11.1):
+   - The Host allowlist and CSRF Origin check derive from
+     `config.settings.port` — **`serve_cmd` resolves `--port` into an
+     effective config before calling the factory**
+     (`dataclasses.replace(config.settings, port=resolved)`); `create_app`
+     itself never reads CLI state.
    - `app.state`: `config`, `db_path`, `runs_manager=None` placeholder
      (issue 26 wires it).
-   - Startup handler: `connect` + `apply_migrations` + `sweep_orphans` +
-     `install_redaction_filter` (§14), then close the startup connection.
+   - Startup handler: `connect` + `apply_migrations` +
+     `runs.sweep_orphans(conn, older_than_hours=1)` (imported from issue
+     08's repo — never reimplemented) + an idempotent
+     `install_redaction_filter` re-assert, then close the startup
+     connection. (Primary redaction install happens earlier in `serve_cmd`
+     — requirement 5.)
    - Request-scoped DB: dependency `get_conn(request)` yielding a new
      connection per request, closed after response (FastAPI dependency with
      `yield`).
@@ -40,8 +55,11 @@ must be complete and tested before pages exist.
      public, max-age=3600` for static, `no-store` for HTML (DESIGN §13.5).
    - Routers included from `web/routes/*` — this issue registers only `GET /`
      placeholder returning a minimal page via `base.html` (replaced in 24)
-     and the error handlers: 404 and 400/validation → `error.html` with
-     status + message (no stack traces ever; DEBUG logs get the traceback).
+     and the error handlers: 404, 400/validation, **and a generic
+     `Exception` handler** — all render `error.html` with status + safe
+     message, never a stack trace (traceback to DEBUG logs only); §13.5
+     headers apply to these responses too (middleware ordering must
+     guarantee it).
 2. `security.py`:
    - `HostValidationMiddleware(allowed_hosts: frozenset[str])`: computed at
      factory time from the port: `{"127.0.0.1", "localhost", "[::1]"} ×
@@ -50,15 +68,29 @@ must be complete and tested before pages exist.
    - `SecurityHeadersMiddleware`: sets, on **every** response including
      errors and static, exactly the DESIGN §13.5 header set (CSP string
      verbatim; `Cache-Control: no-store` only on `text/html`).
-   - CSRF (DESIGN §13.4): `ensure_csrf_cookie(request, response)` — on HTML
-     GET without valid `mybench_csrf` cookie, set one
-     (`secrets.token_urlsafe(32)`, HttpOnly, SameSite=Strict, path=/);
-     `require_csrf(request, form)` dependency for every POST route:
-     403 unless cookie exists, form field `csrf_token` exists, and
-     `hmac.compare_digest` passes; when an `Origin` header is present it must
-     equal `http://{host}` for an allowed host:port, else 403. Provide a
-     FastAPI dependency `CsrfProtect` that page issues declare on POST
-     routes — grep-checkable pattern for issue 32.
+   - CSRF (DESIGN §13.4), exact contract:
+     - Token lifecycle: `get_or_create_csrf_token(request) -> str` — returns
+       the valid cookie value if present, else generates
+       `secrets.token_urlsafe(32)` and stashes it on `request.state` so (a)
+       the `render()` helper injects the SAME value into templates as
+       `csrf_token`, and (b) a response hook sets the cookie (`mybench_csrf`,
+       HttpOnly, SameSite=Strict, path=/) only when newly generated — a
+       valid existing cookie is never rotated.
+     - Enforcement: module-level dependency instance in
+       `mybench/web/security.py`: `csrf_protect` (an instance of class
+       `CsrfProtect`, callable as a FastAPI dependency). Usage pattern
+       (normative, grep-checkable by issue 32): every POST route is declared
+       as `@router.post(path, dependencies=[Depends(csrf_protect)])` with
+       `from mybench.web.security import csrf_protect`. It returns 403
+       unless: cookie exists, form field `csrf_token` exists, and
+       `hmac.compare_digest(cookie, field)` passes; when an `Origin` header
+       is present it must equal `http://{allowed host}:{port}` exactly,
+       else 403.
+     - This issue registers a probe POST route `/_csrf_probe` using exactly
+       that pattern, mounted only when the factory is called with
+       `create_app(..., testing=True)` (keyword defaults to False), so the
+       mechanism is testable before any real POST route exists and never
+       ships in normal serving.
 3. `base.html`: `<!doctype html>`, `<html lang="en">`, `<meta charset>`,
    viewport meta, `<title>{% block title %}mybench{% endblock %}</title>`,
    `<link rel="stylesheet" href="/static/app.css">`, nav links
@@ -72,9 +104,13 @@ must be complete and tested before pages exist.
    page (`.pair-grid { display:grid; grid-template-columns:1fr 1fr }`),
    `.banner` for reveal/notices, `pre/code` wrapping
    (`white-space:pre-wrap; overflow-wrap:anywhere`). No external imports.
-5. `serve_cmd.py` — `mybench serve [--port N] [--open]` (DESIGN §10.7):
-   builds app, `uvicorn.run(app, host="127.0.0.1", port=port,
-   workers=1, log_level="warning" or "debug" with -v, access_log=verbose)`.
+5. `serve_cmd.py` — `mybench serve [--port N] [--open]` (DESIGN §10.7),
+   in order: resolve port (`--port` else `config.settings.port`) → build
+   the effective config (`dataclasses.replace`) → **install the redaction
+   filter immediately** (DESIGN §14: before app creation, so early logs are
+   covered) → `create_app(effective_config, db_path)` →
+   `uvicorn.run(app, host="127.0.0.1", port=port, workers=1,
+   log_level="warning" or "debug" with -v, access_log=verbose)`.
    `--open` → `webbrowser.open(url)` after a short readiness wait (poll the
    port ≤ 3 s in a thread). Prints `mybench ui: http://127.0.0.1:{port}`.
    There is no host flag; assert in test that the CLI rejects `--host`.
@@ -89,28 +125,44 @@ TestClient-based unless noted:
       `/static/app.css`).
 - [ ] Header set golden-asserted on: 200 HTML, 404, 403, static (CSP/nosniff/
       frame/referrer on all; no-store on HTML only).
-- [ ] CSRF: GET sets cookie once (not re-set when valid); POST without
-      cookie / without field / mismatched → 403; matching → passes;
-      `Origin: http://localhost:{port}` passes; `Origin: https://evil.com`
-      → 403 even with valid token.
-- [ ] Error pages contain no traceback text (raise a deliberate error in a
-      test-only route; body lacks `Traceback`).
-- [ ] Startup applies migrations + orphan sweep on a fresh tmp DB.
+- [ ] CSRF via the `/_csrf_probe` route: first HTML GET sets the cookie and
+      the page's hidden field equals the cookie value; a second GET with the
+      valid cookie does NOT re-set it (no `Set-Cookie`); POST without cookie
+      / without field / mismatched → 403 (probe handler not executed);
+      matching → 200; `Origin: http://localhost:{port}` passes;
+      `Origin: https://evil.com` → 403 even with valid token.
+- [ ] 500 handling: a probe route raising `RuntimeError` (testing=True) with
+      `TestClient(app, raise_server_exceptions=False)` → status 500,
+      `error.html` body without `Traceback`, full §13.5 headers present.
+- [ ] Startup applies migrations + orphan sweep on a fresh tmp DB (sweep
+      spy: the issue-08 function is called, not a local copy).
+- [ ] Port override: app built for `--port 9000` accepts
+      `Host: localhost:9000` and rejects `Host: localhost:8137` (403).
 - [ ] base.html has no `style=`/`onclick=`/`<script>` without `src` (assert
-      via template source scan in a test).
-- [ ] `serve` binds 127.0.0.1 (assert uvicorn invocation args via monkeypatch;
-      real-bind smoke lives in issue 30).
+      via template source scan in a test); `tests/helpers.py::
+      assert_secure_response` implemented and self-tested.
+- [ ] `serve` order verified via monkeypatched seams: redaction installed
+      before `create_app`; uvicorn called with host 127.0.0.1, workers=1,
+      resolved port (real-bind smoke lives in issue 30).
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
 
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
 `uv run pytest tests/test_web_security.py tests/test_serve_cmd.py -q`;
-manual: `mybench serve` then `curl -H "Host: evil.com" -i
+optional manual QA (non-gating): `mybench serve` then `curl -H "Host: evil.com" -i
 http://127.0.0.1:8137/` → 403, and browser devtools header inspection.
 
 ## Dependencies
 
-04, 05, 06, 16.
+04, 05, 06, 08 (sweep_orphans import), 16.
 
 ## Non-goals
 

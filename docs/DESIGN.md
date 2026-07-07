@@ -248,22 +248,42 @@ CREATE INDEX idx_tasks_category  ON tasks(category);
 
 Repositories expose typed functions taking/returning frozen dataclasses
 (`Task`, `Run`, `Output`, `Vote`, defined in the respective repo modules).
-All SQL lives here. Key functions (signatures normative, bodies illustrative):
+**Ownership rule:** all writes/mutations to a table live in its repository
+module only; read-only cross-table joins are allowed where this design
+mandates them (e.g. pair selection joins `outputs`/`runs`/`tasks`, export
+dumps read all tables). Key functions (signatures normative):
 
-- `tasks.create(conn, *, title, category, system_prompt, user_prompt, params) -> Task`
+- `tasks.create(conn, *, title, category, system_prompt, user_prompt, params, now=None) -> Task`
 - `tasks.get(conn, task_id) -> Task | None`, `tasks.list_(conn, *, category=None, include_archived=False) -> list[Task]`
-- `tasks.archive(conn, task_id)` / `tasks.unarchive(conn, task_id)`
-- `runs.create_with_outputs(conn, *, task_id, params, model_snapshots) -> Run`
-  (one transaction: run row + one pending output per model)
-- `runs.finish_output(conn, output_id, *, status, content=None, error=None, finish_reason=None, prompt_tokens=None, completion_tokens=None, latency_ms=None)`
-- `runs.complete(conn, run_id)`, `runs.reveal(conn, run_id)`
-- `runs.sweep_orphans(conn, *, older_than_hours=1) -> int` (§7.4)
-- `votes.create(conn, *, run_id, output_a_id, output_b_id, winner, note, blind) -> Vote`
+- `tasks.run_counts(conn, task_ids) -> dict[int, int]`,
+  `tasks.list_categories(conn) -> list[str]` (distinct, sorted)
+- `tasks.archive(conn, task_id, now=None) -> bool` / `tasks.unarchive(conn, task_id) -> bool`
+- `runs.create_with_outputs(conn, *, task_id, params_json: str, model_snapshots: Sequence[tuple[str, str]], now=None) -> Run`
+  (one transaction: run row + one pending output per `(model_id, snapshot_json)`;
+  the returned `Run` carries `outputs: tuple[Output, ...]` ordered as passed)
+- `runs.finish_output(conn, output_id, *, status, content=None, error=None, finish_reason=None, prompt_tokens=None, completion_tokens=None, latency_ms=None, now=None)`
+  (sets `finished_at`; unknown id → `ValueError`)
+- `runs.complete(conn, run_id, now=None)` (guarded: only from `running`),
+  `runs.reveal(conn, run_id, now=None) -> bool`
+- `runs.get(conn, run_id) -> Run | None`, `runs.outputs_of(conn, run_id) -> list[Output]`,
+  `runs.list_runs(conn, *, task_id=None, limit=50) -> list[RunListItem]`,
+  `runs.status_counts(conn, run_id) -> dict[str, int]`, `runs.count(conn) -> int`
+- `runs.sweep_orphans(conn, *, older_than_hours=1, now=None) -> int` (§7.4)
+- `votes.create(conn, *, run_id, output_a_id, output_b_id, winner, note=None, now=None) -> Vote`
+  — `blind` is computed **inside the transaction** from `runs.revealed_at`
+  (§8.5); callers never pass it
 - `votes.delete(conn, vote_id) -> bool`
 - `votes.next_pair(conn, *, category=None, task_id=None, run_id=None) -> Pair | None` (§8.3)
-- `votes.unvoted_pair_count(conn, ...) -> int`
+- `votes.unvoted_pair_count(conn, ...) -> int`,
+  `votes.counts(conn) -> tuple[int, int]` (blind, non-blind totals)
+- `votes.list_votes(conn, *, limit=100) -> list[VoteListItem]`
 - `votes.games(conn, *, category=None, include_nonblind=False) -> list[Game]`
   (vote rows joined to model ids, for rating §9.1)
+- `db.dump_all(conn) -> dict[str, list[dict]]` — read-only full-table dump for
+  export (§10.9); table set fixed to the four §4.3 tables
+
+All timestamps accepted via optional `now: str | None` (§4.1 format) for test
+injection; `None` → `utc_now_iso()`.
 
 ## 5. Configuration and paths
 
@@ -275,9 +295,16 @@ All SQL lives here. Key functions (signatures normative, bodies illustrative):
 | Data dir | `$MYBENCH_DATA_DIR` → `$XDG_DATA_HOME/mybench` → `~/.local/share/mybench` |
 | DB file | `{data_dir}/mybench.db` |
 
+Env var handling: empty-string values are treated as unset (fall through);
+values are normalized with `Path(v).expanduser().resolve(strict=False)`
+(relative paths resolve against CWD). CLI global options (`--config`,
+`--data-dir`, §10.1) take precedence over env vars.
+
 `paths.py` exposes `config_path() -> Path`, `data_dir() -> Path`,
-`db_path() -> Path`. `data_dir()` creates the directory with mode `0700` if
-missing and tightens permissions if wider (§13.7).
+`db_path() -> Path`. `data_dir()` creates the directory (missing parents
+created as needed) with mode `0700`, tightens the final directory's
+permissions if wider, never chmods ancestors, and raises if the path exists
+but is not a directory (§13.7). `config_path()` has no side effects.
 
 ### 5.2 Config file format
 
@@ -319,7 +346,7 @@ model = "qwen3:14b"
 | `models[].id` | required; regex `^[a-z0-9][a-z0-9._-]{0,63}$`; unique across file |
 | `models[].provider` | one of `openai_compat`, `anthropic`, `fake` |
 | `models[].model` | required non-empty string (except `fake`: optional) |
-| `models[].base_url` | `openai_compat`: required; `anthropic`: optional (default above); `fake`: forbidden. Scheme `https` or `http`; `http` only when host ∈ {`localhost`,`127.0.0.1`,`::1`} else error |
+| `models[].base_url` | `openai_compat`: required; `anthropic`: optional — **normalized to `https://api.anthropic.com` at load time** so adapters always see a value; `fake`: forbidden. Scheme `https` or `http`; `http` only when host ∈ {`localhost`,`127.0.0.1`,`::1`} else error |
 | `models[].api_key_env` | env var *name* (regex `^[A-Z][A-Z0-9_]*$`). Required for `anthropic` and for `openai_compat` with non-loopback base_url; optional for loopback; forbidden for `fake`. A literal `api_key` field anywhere → error telling the user to use `api_key_env` |
 | `models[].enabled` | bool, default `true` |
 | `settings.*` | ranges as in §5.2 comments; unknown keys in `[settings]` or model entries → error (typo protection) |
@@ -329,6 +356,8 @@ Loaded config is exposed as frozen dataclasses `Settings` and
 `ModelConfig`; `Config.enabled_models` preserves file order. The API key
 *value* is read from the environment lazily at provider-build time; a missing
 env var at run time is a per-model provider `auth` error, not a config error.
+Config error messages name the TOML location and the violated rule but never
+echo the raw value of secret-adjacent fields (`api_key`, `api_key_env`).
 
 ### 5.4 Task parameter validation (shared by CLI/web forms)
 
@@ -348,9 +377,20 @@ env var at run time is a per-model provider `auth` error, not a config error.
 - `strip_terminal_controls(s: str) -> str` — removes ANSI/CSI/OSC escape
   sequences and C0 control chars except `\n` and `\t`. Applied to **any**
   model- or task-originated text echoed to a terminal (§13.6).
-- `truncate(s, limit, marker="…[truncated]")`.
-- `redact(s: str, secrets: list[str]) -> str` — replaces each secret value
-  with `[REDACTED]`; used by the logging filter (§14).
+- `truncate(s, limit, marker="…[truncated]")` — result length ≤ `limit`;
+  when `limit <= len(marker)` the result is `marker[:limit]`.
+- `redact(s: str, replacements: Sequence[tuple[str, str]]) -> str` — replaces
+  each `(secret_value, replacement)` pair, longest secret first.
+- `install_redaction_filter(secret_env_vars: Sequence[str]) -> None` — wraps
+  the formatter of every root-logger handler with a `RedactingFormatter`
+  that applies `redact` to the **fully formatted record** (message, args,
+  and exception traceback text) using replacement `[REDACTED:{ENV_NAME}]`
+  per env var. Installed at process start by both entry points (§14).
+  Idempotent.
+- `validate_task_params(...) -> list[str]` — §5.4 task-parameter rules with
+  exact user-facing messages (single source; CLI/web render them verbatim).
+  The vote-note limit constant lives here; note length is enforced in
+  `votes.create` (§4.4).
 - Limit constants from §5.4 live here (single source).
 
 ## 6. Provider layer
@@ -399,7 +439,19 @@ class ProviderError(Exception):
     message: str          # sanitized: never contains header values or key material
     status_code: int | None
     retryable: bool       # True only for rate_limit, 5xx api_error, connection
+
+    @classmethod
+    def from_status(cls, status_code: int, message: str) -> "ProviderError":
+        # 401/403 -> auth; 429 -> rate_limit; >=500 -> api_error retryable;
+        # other 4xx -> api_error non-retryable
+        ...
 ```
+
+Message hygiene is layered: the constructor control-strips and truncates
+(300 chars) every message; network adapters must additionally scrub the
+resolved API key value from any provider-derived text (error bodies, debug
+logs) *before* constructing errors — a hostile provider may echo the
+`Authorization` header back (§13.1 B4).
 
 ### 6.3 Provider protocol
 
@@ -408,6 +460,7 @@ class Provider(Protocol):
     model_config: ModelConfig
     async def complete(self, request: CompletionRequest) -> CompletionResult: ...
     async def check(self) -> CheckResult: ...   # 1-token real completion ("ping"), §10.4
+    async def aclose(self) -> None: ...         # release transport resources; no-op for fake
 ```
 
 ### 6.4 Registry (`providers/__init__.py`)
@@ -451,8 +504,11 @@ Deterministic, offline: content =
 
 ### 6.8 Transport policy (both network adapters)
 
-- One `httpx.AsyncClient` per adapter instance; TLS verify always on;
-  `follow_redirects=False` (redirect → `connection` error).
+- One `httpx.AsyncClient` per adapter instance, built by the shared helper
+  `providers.base.default_client(settings)`; TLS verify always on;
+  `follow_redirects=False` — any 3xx response maps to
+  `ProviderError(kind=connection, retryable=False, message="redirect
+  response not allowed")`.
 - Timeouts: connect 10 s; total budget = `settings.timeout_seconds` enforced
   by the runner via `asyncio.timeout` (§7.2); httpx read timeout set to the
   same value.
@@ -472,7 +528,9 @@ async def execute_run(
     config: Config,
     *,
     task: Task,
-    model_ids: list[str],              # ≥2, all enabled, deduplicated, validated by caller message-level
+    model_ids: list[str],              # engine validation is authoritative (≥2 after dedup,
+                                       # known+enabled, task not archived); callers may
+                                       # pre-validate for friendlier messages
     param_overrides: dict | None = None,
     progress: Callable[[OutputEvent], None] | None = None,   # CLI progress lines
     on_created: Callable[[int], None] | None = None,         # fired with run_id right after rows exist (web §11.6)
@@ -488,9 +546,12 @@ Effective params = task.params overridden by `param_overrides` (validated per
    output per model (§4.4 `create_with_outputs`).
 2. `asyncio.Semaphore(settings.max_concurrency)`; for each model, a coroutine:
    build provider → `asyncio.timeout(settings.timeout_seconds)` around
-   `complete()` → on success/failure, its own short transaction via
-   `finish_output`. Every exception path maps to a `ProviderError`; unexpected
-   exceptions map to `invalid_response` with class name (no traceback in DB).
+   `complete(CompletionRequest(...))` built from the task's prompts + the
+   effective params → on success/failure, its own short transaction via
+   `finish_output`; `finally: await provider.aclose()`. Persisted failure
+   text is exactly `ProviderError.message` (already sanitized per §6.2);
+   unexpected exceptions persist `invalid_response: {ClassName}` (no
+   traceback in DB; traceback goes to DEBUG logs only).
 3. `asyncio.gather(..., return_exceptions=True)` — one model's failure never
    cancels others.
 4. Final transaction: `runs.complete()` sets `status='completed'`,
@@ -637,7 +698,8 @@ Singleton models (0 games) are excluded from fitting and reported separately.
 ### 9.4 Display scale
 
 `rating_i = round(400 * log10(p_i) + C_component)` with `C` chosen so the
-arithmetic mean of ratings in each component is 1000.
+arithmetic mean of ratings in each component is 1000. `round` is Python's
+built-in (banker's rounding at .5 — acceptable; the scale is cosmetic).
 
 ### 9.5 Uncertainty (`rating/bootstrap.py`)
 
@@ -648,9 +710,13 @@ def bootstrap_ci(games, *, samples: int = 200, seed: int | None = None,
 
 Resample the game list with replacement (`random.Random(seed)`), refit,
 collect per-model ratings (models absent from a resample are skipped for that
-sample), return percentile intervals on the display scale. `samples=0`
-disables (returns empty dict). Performance target: full leaderboard including
-CI < 2 s at 5,000 votes / 15 models / 200 samples (pure Python).
+sample), return percentile intervals on the display scale. Percentile
+algorithm (normative): sort the samples; index `k = q * (n - 1)`; linearly
+interpolate between `floor(k)` and `ceil(k)`; convert with `int(round(v))`.
+`samples=0` or empty games → `{}`. Performance target: full leaderboard
+including CI < 2 s at 5,000 votes / 15 models / 200 samples (pure Python);
+the CI test asserts < 4 s as a runner-variance guard — a measured local time
+above 2 s triggers Known Unknown U4, not a silent threshold bump.
 
 ### 9.6 Leaderboard assembly (`rating/leaderboard.py`)
 
@@ -669,12 +735,16 @@ class LeaderboardRow:
     provisional: bool   # games < 10
     component: int      # 0-based; single component → all 0
 
+@dataclass(frozen=True)
+class Leaderboard:
+    rows: tuple[LeaderboardRow, ...]   # sorted: component asc, then rating desc
+    components_count: int
+    unrated_models: tuple[str, ...]    # known_model_ids with 0 games, sorted
+    total_votes: int                   # games counted after filters, before regularization
+
 def compute_leaderboard(conn, *, category=None, include_nonblind=False,
                         bootstrap_samples=200, seed=None,
                         known_model_ids: Sequence[str] | None = None) -> Leaderboard
-    # Leaderboard(rows sorted by rating desc within component, components_count,
-    #             unrated_models: list[str] with 0 games (from known_model_ids,
-    #             which callers fill with configured model ids), total_votes)
 ```
 
 No caching in v1: recompute per request (ADR-003). CLI and web both call this.
@@ -729,14 +799,18 @@ Prompt source precedence: exactly one of positional PROMPT, `--file`,
 category, created, runs count. `task show ID [--json]` — full task; prompt
 bodies control-stripped.
 
-### 10.6 `mybench run TASK_ID (--models a,b,c | --all) [--json]`
+### 10.6 `mybench run TASK_ID (--models a,b,c | --all) [--temperature F] [--top-p F] [--max-tokens N] [--json]`
 
-`--models`: comma-separated config ids; `--all`: all enabled models. Errors if
-resolved set < 2, any id unknown/disabled, or task archived. Progress to
-stderr as models finish (`[2/3] sonnet ok 4.1s 812tok`); summary table to
-stdout (model, status, latency, tokens, error). Exit 0 if ≥ 2 succeeded;
+`--models`: comma-separated config ids; `--all`: all enabled models. The
+optional param flags form run-level overrides (§7.1). The command
+pre-validates for friendly errors (task exists & not archived, ids
+known/enabled, ≥ 2 after dedup) and exits 1 without invoking the engine;
+the engine re-validates authoritatively (§7.1). Progress to stderr as models
+finish (`[2/3] sonnet ok 4.1s 812tok`; `-` for missing values); summary table
+to stdout (model, status, latency, tokens, error). Exit 0 if ≥ 2 succeeded;
 **exit 2** if run completed with < 2 successes (not votable); exit 1 on fatal
-(config/task errors). `--json`: RunSummary JSON on stdout.
+(config/task errors). `--json`: RunSummary JSON on stdout (JSON string
+escaping keeps control bytes off the terminal).
 Prints vote hint: `vote: mybench serve → http://127.0.0.1:{port}/vote?run={id}`.
 
 ### 10.7 `mybench serve [--port N] [--open]`
@@ -747,9 +821,16 @@ Refuses to accept a `--host` (none exists — ADR-005). Prints the URL.
 
 ### 10.8 `mybench leaderboard [--category C] [--include-nonblind] [--json]`
 
-Renders `compute_leaderboard` as an aligned text table (columns of §9.6, CI as
-`+hi/-lo` offsets); components separated by a blank line + header when > 1;
-unrated models listed under `no games yet:`. `--json`: full Leaderboard as JSON.
+Renders `compute_leaderboard` as an aligned text table. Header:
+`leaderboard — {total_votes} votes (blind only|including non-blind)` plus
+`category: {c}` when filtered. Columns of §9.6 with CI as `+hi/-lo` offsets
+(`-` when disabled); rates rendered as `value*100` with one decimal and `%`
+(`-` when `None`). Components (display 1-based, ordered by component index)
+separated by a blank line + header `component {i} ({n} models)` when > 1;
+unrated models listed under `no games yet:` after the table. Empty-state
+precedence: when `total_votes == 0`, print `no votes yet; run tasks and vote
+first` to stderr and exit 0 (text mode only — `--json` always prints the full
+Leaderboard document).
 
 ### 10.9 `mybench export --out PATH [--format json|csv] [--force]`
 
@@ -762,6 +843,9 @@ unrated models listed under `no games yet:`. `--json`: full Leaderboard as JSON.
   (model id or "tie"/"both_bad"), note`.
 - Refuses existing PATH without `--force`. Files written `0600`. Exit 1 on
   refusal.
+- `export.export_stats(conn) -> dict[str, int]` (keys exactly `tasks`,
+  `runs`, `outputs`, `votes`) backs the CLI summary line; the module also
+  exports `EXPORT_SENSITIVITY_NOTE` (the exact §13.6 reminder text).
 
 ### 10.10 `mybench config path|validate`, `mybench version`
 
@@ -790,18 +874,24 @@ and runs uvicorn programmatically.
 | GET | `/tasks/{id}` | tasks | detail: prompt, params, runs of task, run-trigger form (model checkboxes, param overrides) |
 | POST | `/tasks/{id}/archive`, `/tasks/{id}/unarchive` | tasks | toggle → 303 back |
 | POST | `/tasks/{id}/runs` | runs | validate (≥2 models) → create run via runs_manager → 303 to `/runs/{id}` |
-| GET | `/runs` | history | run list: task, status, models (names only — allowed, mapping is not shown), succeeded/total |
-| GET | `/runs/{id}` | history | run detail per §11.5 blindness rules |
-| GET | `/runs/{id}/status.json` | runs | JSON: `{"status": "...", "pending": n, "succeeded": n, "failed": n, "votable": bool}` (no model↔content mapping) |
-| POST | `/runs/{id}/reveal` | history | set revealed_at → 303 back |
+| GET | `/runs` | history | run list: task, status, models (ids only — allowed, mapping is not shown), succeeded/total |
+| GET | `/runs/{id}` | runs | run detail per §11.5 blindness rules |
+| GET | `/runs/{id}/status.json` | runs | JSON: `{"status": "...", "pending": n, "succeeded": n, "failed": n, "votable": bool}` (no model ids, no model↔content mapping) |
+| POST | `/runs/{id}/reveal` | runs | set revealed_at → 303 back |
 | GET | `/vote` | vote | next pair (filters `?category=&task=&run=`); empty-queue page when none; reveal banner via `?reveal={vote_id}` |
 | POST | `/votes` | vote | create vote → 303 `/vote?reveal={id}&{filters}` |
 | POST | `/votes/{id}/delete` | history | delete vote → 303 to `/votes` |
 | GET | `/votes` | history | vote history: task, models (revealed — vote already happened), winner, blind flag, note, delete button |
 | GET | `/leaderboard` | leaderboard | table per §9.6; `?category=&include_nonblind=1`; method footnote |
 
-404/400 pages: minimal templates; POST validation errors re-render the form
-with field errors (status 400) — no redirect-with-flash machinery in v1.
+404/400 pages: minimal templates; POST validation errors on user-typed forms
+(`/tasks`, run trigger) re-render the form with field errors (status 400).
+`POST /votes` integrity failures (tampered hidden fields) return the 400
+error page instead — they are not user typos. A generic 500 handler renders
+`error.html` with no stack trace (traceback to DEBUG logs only); §13.5
+headers apply to every error response. Query params are validated:
+`category` must match the §5.4 slug regex (else 400), numeric ids must parse
+(else 400; unknown ids → 404) — no redirect-with-flash machinery in v1.
 
 ### 11.3 Templates
 
@@ -823,13 +913,18 @@ inline script/style) + `dashboard.html`, `tasks_list.html`, `task_form.html`,
 
 While any unvoted pair exists **and** `revealed_at IS NULL`:
 
-- show per-model rows: model_id, status, latency, tokens, error (if failed) —
-  but **no content**;
+- show per-model rows: **model_id, status, latency, tokens, error only** (no
+  content, no provider/base_url/raw_model — those identify outputs when read
+  next to the cards; they appear nowhere on the pre-reveal page). Output ids
+  do not appear in this table (they would map rows to cards);
 - show outputs as anonymized cards labeled by opaque output id, ordered by
   `output_id` (stable), with content rendered per §12 — but **no model names
   on the cards**;
 - show a "Reveal models now" button (POST, CSRF-protected) with the warning
   "votes cast after reveal are marked non-blind".
+
+A completed run with < 2 succeeded outputs shows an explicit "not votable:
+fewer than 2 outputs succeeded" banner and no vote link (§7.3).
 
 Otherwise (no unvoted pair left, or already revealed): render cards with model
 names; set `revealed_at` if NULL and no unvoted pair remains.
@@ -845,8 +940,14 @@ simplification, listed in §18.
 
 ## 12. Output rendering and sanitization
 
-One function used by *every* template that shows model- or user-originated
-text as HTML: `web.render.markdown_safe(text: str) -> Markup`.
+Two normative helpers in `web.render`, and a policy for what uses which:
+
+- `markdown_safe(text: str) -> Markup` — for **content bodies** rendered as
+  markdown: model outputs, task system/user prompts.
+- `escape_pre(text: str) -> Markup` — HTML-escape only; for raw-text views
+  (`<details><pre>` blocks) and provider error strings.
+- **Scalar metadata** (titles, categories, model ids, notes) is rendered as
+  plain text through Jinja autoescape — never as markdown.
 
 Pipeline (order matters):
 
@@ -860,10 +961,12 @@ Pipeline (order matters):
 3. Wrap as Jinja `Markup` (the only `|safe`-equivalent in the codebase; direct
    use of `|safe` in templates is forbidden and checked in review).
 
-Raw view: every rendered output card also offers `<details><pre>{escaped raw
-text}</pre></details>`. No syntax highlighting in v1 (§2.2). Notes and prompts
-rendered with the same pipeline. Model `error` strings render as plain escaped
-text, never markdown.
+Raw view: every rendered output card also offers `<details><pre>{{ text }}
+</pre></details>` via `escape_pre`/autoescape (never `|safe`). No syntax
+highlighting in v1 (§2.2). Model `error` strings render via `escape_pre`,
+never markdown. Note: `MarkdownIt("commonmark")` does not render pipe
+tables; table tags remain in the sanitizer allowlist only as
+defense-in-depth for future extension.
 
 ## 13. Security model
 
@@ -919,7 +1022,10 @@ Referrer-Policy: no-referrer
 Cache-Control: no-store            # HTML routes only; static may cache
 ```
 
-No inline `<script>`/`<style>`/event handlers anywhere; no external origins.
+No inline `<script>`/`<style>`/event handlers anywhere. No external
+**subresources** (scripts, styles, fonts, images — CSP enforces this);
+plain `<a href>` navigation links to the project's own GitHub docs are
+permitted (user-initiated navigation loads nothing into the page).
 
 ### 13.6 Secrets and content hygiene
 
@@ -958,9 +1064,12 @@ before v1 is called done.
 
 - Stdlib `logging`, root logger `mybench`. Console handler; default INFO
   (uvicorn access logs off by default; `-v` → DEBUG + access logs).
-- **Redaction filter installed on the root handler at process start**: for
-  every configured `api_key_env` whose env var is set, its *value* is replaced
-  with `[REDACTED:{ENV_NAME}]` in all records (uses `safety.redact`).
+- **Redaction installed at process start, before any other work** (CLI: in
+  the group callback immediately after config load; server: in `serve_cmd`
+  before app creation): `safety.install_redaction_filter` wraps handler
+  formatters so every configured `api_key_env` value becomes
+  `[REDACTED:{ENV_NAME}]` in the fully formatted output — message, args,
+  and exception tracebacks (§5.5).
 - Provider calls log at INFO: model id, status, latency, token counts — never
   bodies. DEBUG may log bodies truncated to 500 chars (post-redaction).
 - No telemetry, no crash reporting, no update checks (ADR-005).

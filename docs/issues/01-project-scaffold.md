@@ -25,24 +25,50 @@ currently contains only documentation.
 
 ## Detailed Requirements
 
-1. `pyproject.toml`:
-   - `[project]`: name `mybench`, description "A private leaderboard for blind
-     A/B testing LLMs on your own real tasks.", `requires-python = ">=3.11"`,
-     license `MIT`, dynamic version from `mybench.__init__.__version__`
-     (hatchling `[tool.hatch.version] path = "src/mybench/__init__.py"`).
-   - Runtime dependencies exactly (ADR-002 allowlist): `click`, `fastapi`,
-     `uvicorn`, `jinja2`, `httpx`, `markdown-it-py`, `nh3`.
-   - `[dependency-groups] dev`: `pytest`, `pytest-asyncio`, `ruff`, `mypy`,
-     `pip-audit`, `coverage[toml]`.
-   - `[project.scripts] mybench = "mybench.cli.main:cli"`.
-   - Build backend hatchling; package data will include
-     `web/templates/**` and `web/static/**` (configure
-     `[tool.hatch.build.targets.wheel]` to include `src/mybench`).
-2. Module tree: create every file listed in DESIGN §3.1 as a module with only
-   a docstring line `"""Implements DESIGN §<n> (placeholder)."""`, except:
-   - `src/mybench/__init__.py`: `__version__ = "0.1.0"`.
-   - `src/mybench/cli/main.py`: minimal working click group `cli` with
-     `--version` support (click's `version_option`) so the console script runs.
+1. `pyproject.toml` — must match this skeleton (add nothing else without an
+   ADR-002 amendment):
+
+   ```toml
+   [build-system]
+   requires = ["hatchling"]
+   build-backend = "hatchling.build"
+
+   [project]
+   name = "mybench"
+   description = "A private leaderboard for blind A/B testing LLMs on your own real tasks."
+   requires-python = ">=3.11"
+   license = "MIT"
+   dynamic = ["version"]
+   dependencies = [
+     "click", "fastapi", "uvicorn", "jinja2", "httpx", "markdown-it-py", "nh3",
+   ]
+
+   [project.scripts]
+   mybench = "mybench.cli.main:cli"
+
+   [dependency-groups]
+   dev = ["pytest", "pytest-asyncio", "ruff", "mypy", "pip-audit", "coverage[toml]"]
+
+   [tool.hatch.version]
+   path = "src/mybench/__init__.py"
+
+   [tool.hatch.build.targets.wheel]
+   packages = ["src/mybench"]
+   ```
+
+   (Version pins/floors may be added to `dependencies` if `uv lock` requires
+   them; the package *set* is fixed by ADR-002. Tool config sections are added
+   in requirement 3.)
+2. Module tree: create every file listed in DESIGN §3.1. Each placeholder
+   module contains exactly one docstring line:
+   `"""Implements DESIGN §<n> (placeholder)."""` where `<n>` is the section
+   number annotated for that file in the §3.1 tree (e.g. `paths.py` → §5.1).
+   Exceptions:
+   - `src/mybench/__init__.py`: docstring + `__version__ = "0.1.0"`.
+   - `src/mybench/cli/main.py`: minimal importable click group named `cli`
+     (no options, no commands) so the console script resolves;
+     `mybench --help` must exit 0. All real CLI behavior (including
+     `version`) is issue 16.
    - `web/templates/` and `web/static/` as directories with `.gitkeep`.
 3. Tooling config in `pyproject.toml`:
    - ruff: `line-length = 100`, `target-version = "py311"`, lint select
@@ -54,14 +80,14 @@ currently contains only documentation.
    - coverage: `source = ["mybench"]`; fail-under handled in CI (issue 02).
 4. `.gitignore`: standard Python (`__pycache__/`, `.venv/`, `dist/`,
    `.coverage`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`).
-5. `tests/test_smoke.py`: (a) `import mybench` exposes `__version__`;
-   (b) `CliRunner` invokes `cli --version` exit code 0 containing `0.1.0`.
+5. `tests/test_smoke.py`: (a) `import mybench` exposes `__version__ ==
+   "0.1.0"`; (b) `CliRunner` invokes the group with `--help`, exit code 0.
 6. Do not implement any product logic in this issue.
 
 ## Acceptance Criteria
 
 - [ ] `uv sync --dev` succeeds on a clean checkout; `uv.lock` committed.
-- [ ] `uv run mybench --version` prints `0.1.0` and exits 0.
+- [ ] `uv run mybench --help` exits 0.
 - [ ] `uv run pytest -q` passes (smoke test).
 - [ ] `uv run ruff check .` and `uv run ruff format --check .` pass.
 - [ ] `uv run mypy src` passes.
@@ -71,8 +97,25 @@ currently contains only documentation.
 
 ## Validation
 
-Run the five commands above from a clean clone. Inspect the wheel
-(`unzip -l dist/*.whl`) to confirm `mybench/` is packaged from `src/`.
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
+From a clean clone, run in order; all must succeed:
+
+```sh
+uv sync --dev
+uv run mybench --help
+uv run ruff check . && uv run ruff format --check .
+uv run mypy src
+uv run pytest -q
+uv build
+python -c "import zipfile,glob; names=zipfile.ZipFile(glob.glob('dist/mybench-*.whl')[0]).namelist(); assert any(n.startswith('mybench/') and n.endswith('__init__.py') for n in names), names"
+```
 
 ## Dependencies
 

@@ -24,9 +24,10 @@ UI check was bypassed (boundary B7).
 1. `@dataclass(frozen=True, slots=True) class Task`: `id: int`,
    `title: str | None`, `category: str`, `system_prompt: str | None`,
    `user_prompt: str`, `params: TaskParams`, `created_at: str`,
-   `archived_at: str | None`, plus property
-   `display_title -> str` (title, else first 80 chars of user_prompt with
-   newlines collapsed to spaces).
+   `archived_at: str | None`, plus property `display_title -> str`:
+   `title` when set; otherwise collapse all whitespace runs (incl. newlines)
+   in `user_prompt` to single spaces, strip, then take the first 80
+   characters (collapse first, then cut).
 2. `@dataclass(frozen=True, slots=True) class TaskParams`:
    `temperature: float | None`, `top_p: float | None`,
    `max_tokens: int | None`; helpers `to_json() -> str` (compact, sorted
@@ -36,33 +37,55 @@ UI check was bypassed (boundary B7).
    manage their own `tx`):
    - `create(conn, *, title, category, system_prompt, user_prompt, params,
      now: str | None = None) -> Task` — calls
-     `safety.validate_task_params`; violations → raise `ValueError` with the
-     joined messages; `category=None` → `"general"`.
+     `safety.validate_task_params(...)` (issue 06 contract: keyword args,
+     returns `list[str]` of exact normative messages); non-empty list →
+     raise `ValueError` with the messages joined by newlines;
+     `category=None` → `"general"`.
    - `get(conn, task_id: int) -> Task | None`
    - `list_(conn, *, category: str | None = None,
      include_archived: bool = False) -> list[Task]` — newest first.
    - `run_counts(conn, task_ids: Sequence[int]) -> dict[int, int]` — for list
-     views.
+     views (read-only join against `runs`, allowed per DESIGN §4.4).
+   - `list_categories(conn) -> list[str]` — distinct categories, sorted
+     (DESIGN §4.4; used by the leaderboard filter, issue 28).
    - `archive(conn, task_id, now=None) -> bool` /
      `unarchive(conn, task_id) -> bool` — return False when task missing;
-     archive is idempotent (already archived → True, unchanged timestamp).
-4. Parametrized SQL only; no SQL outside this module for the `tasks` table.
+     both idempotent: already-archived archive → True with unchanged
+     timestamp; already-active unarchive → True, no change.
+4. Parametrized SQL only. Writes to `tasks` happen only in this module;
+   read-only joins from other repo modules are allowed where DESIGN mandates
+   them (§4.4 ownership rule — e.g. pair selection).
 5. mypy-strict clean.
 
 ## Acceptance Criteria
 
 - [ ] create→get round-trips every field including params JSON.
-- [ ] `create` rejects: oversized user_prompt, bad category slug, temperature
-      3.0 (each raising `ValueError` containing the §5.4 message).
+- [ ] `create` rejects every §5.4 task rule (parametrized over issue 06's
+      normative violations: missing/oversized user_prompt, oversized
+      system_prompt, oversized title, bad category slug, temperature out of
+      range, top_p out of range, max_tokens out of range), each raising
+      `ValueError` containing the exact issue-06 message; `category=None`
+      persists as `general`.
 - [ ] `list_` filters by category, excludes archived by default, includes with
       flag, orders newest first (fixture with distinct created_at values).
-- [ ] `display_title` fallback: multi-line prompt collapses; ≤ 80 chars.
-- [ ] archive/unarchive round-trip; missing id → False; double-archive keeps
-      original `archived_at`.
+- [ ] `list_categories` returns distinct sorted categories.
+- [ ] `display_title` fallback: multi-line prompt collapses whitespace before
+      the 80-char cut (fixture where order matters proves collapse-then-cut).
+- [ ] archive/unarchive round-trip; missing id → False for both;
+      double-archive keeps original `archived_at`; unarchive of active task
+      → True, no change.
 - [ ] `params from_json` ignores unknown keys.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_tasks_repo.py -q` against a `tmp_path` DB created
 via issue 05's `apply_migrations`.

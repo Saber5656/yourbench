@@ -24,7 +24,9 @@ hand-computed fixtures.
 ## Detailed Requirements
 
 1. Input type: reuse `Game` from `mybench.db.votes` (`model_lo`, `model_hi`,
-   `score_lo` ∈ {1.0, 0.0, 0.5}).
+   `score_lo` ∈ {1.0, 0.0, 0.5}; the `kind` field is ignored by fitting).
+   "No third-party imports" below means exactly that — this first-party
+   type import is expected (dependency on issue 09).
 2. `def fit_bradley_terry(games: Sequence[Game], *,
    regularization_virtual_ties: float = 1.0, max_iter: int = 1000,
    tol: float = 1e-8) -> dict[str, float]`:
@@ -32,7 +34,9 @@ hand-computed fixtures.
      and game counts `n[i][j]`.
    - Regularization (DESIGN §9.2): for each unordered pair with
      `n[i][j] > 0`, add `regularization_virtual_ties` tied games:
-     `w[i][j] += 0.5 * r; w[j][i] += 0.5 * r; n[i][j] += r`.
+     `w[i][j] += 0.5 * r; w[j][i] += 0.5 * r`; game counts stay symmetric —
+     increment **both** `n[i][j]` and `n[j][i]` by `r` (or store `n` keyed
+     by the unordered pair and read symmetrically).
    - MM update per DESIGN §9.2; renormalize strengths to geometric mean 1
      **per component** each sweep; converge when
      `max_i |p_i' − p_i| / p_i < tol`; raise `RuntimeError` if not converged
@@ -43,8 +47,8 @@ hand-computed fixtures.
    members are sets).
 4. `def to_display_ratings(strengths: dict[str, float],
    components: list[set[str]]) -> dict[str, int]` — per component:
-   `400 * log10(p) + C` with `C` s.t. arithmetic mean = 1000; round half away
-   from zero to int (DESIGN §9.4).
+   `400 * log10(p) + C` with `C` s.t. arithmetic mean = 1000; convert with
+   Python's built-in `round()` (DESIGN §9.4).
 5. Edge cases: empty games → `{}` / `[]`; single pair; a model that lost
    every real game must still get a finite rating (regularization proof).
 6. Pure stdlib (`math`, `collections`); no numpy (ADR-002). mypy-strict.
@@ -63,20 +67,32 @@ hand-computed fixtures.
       strictly ordered A > B > C.
 - [ ] Components: {A,B} and {C,D} disjoint fixtures → two components; each
       anchored to mean 1000 independently in display ratings.
-- [ ] Display scale: hand-computed 2-model case matches expected integer
-      ratings (document the arithmetic in the test).
-- [ ] Convergence guard: `max_iter=1` on a non-trivial fixture raises
-      `RuntimeError`.
-- [ ] ruff, mypy strict, pytest green; module has zero non-stdlib imports.
+- [ ] Display scale: for strengths `{A: 3.0, B: 1.0}` normalized to
+      geometric mean 1 in one component, ratings are
+      `A = round(1000 + 200*log10(3)) = 1095`,
+      `B = round(1000 - 200*log10(3)) = 905` (document the arithmetic in
+      the test).
+- [ ] Convergence guard: the `w_AB=3, w_BA=1` fixture with
+      `regularization_virtual_ties=0, tol=1e-8, max_iter=1` raises
+      `RuntimeError` whose message contains the achieved delta.
+- [ ] ruff, mypy strict, pytest green; module imports nothing outside the
+      stdlib and `mybench.db.votes` (the `Game` type).
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_bradley_terry.py -q`.
 
 ## Dependencies
 
-01 (and the `Game` type from 09 — import only; if 09 is not merged yet,
-coordinate ordering with the plan owner rather than duplicating the type).
+01, 09 (the `Game` type import).
 
 ## Non-goals
 

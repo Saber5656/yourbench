@@ -25,11 +25,15 @@ boundary B4.
 
 1. `class OpenAICompatProvider` implementing the `Provider` protocol;
    constructor `(model_cfg: ModelConfig, settings: Settings,
-   api_key: str | None)`; owns one `httpx.AsyncClient` created with
-   `verify=True`, `follow_redirects=False`,
-   `timeout=httpx.Timeout(connect=10.0, read=settings.timeout_seconds,
-   write=30.0, pool=10.0)`; `async close()` closes it (runner/CLI call it via
-   `contextlib.aclosing`-style usage; also implement `__aenter__/__aexit__`).
+   api_key: str | None)`; owns one `httpx.AsyncClient` obtained from
+   `providers.base.default_client(settings)` (issue 10 — verify on, no
+   redirects, §6.8 timeouts); `async aclose()` closes it (protocol method the
+   runner calls in `finally`).
+   **Key scrubbing (§6.2, B4):** the adapter keeps the resolved `api_key`
+   and applies `text.replace(api_key, "[REDACTED]")` to every
+   provider-derived string (error bodies, debug-log payloads) *before*
+   constructing `ProviderError`s or log records — a hostile server may echo
+   the `Authorization` header back.
 2. Request (DESIGN §6.5 + research §2): POST `{base_url}/chat/completions`
    (join with a single slash regardless of trailing slash in config), JSON
    body: `model`, `messages` (system message only when `system_prompt` is not
@@ -38,8 +42,12 @@ boundary B4.
    resolved. No other headers beyond content-type/user-agent
    (`mybench/{__version__}`).
 3. Response parsing:
-   - Non-2xx → `ProviderError.from_status` with message from
-     `error.message` (dict), else body text; body read capped (req. 4).
+   - 3xx (any) → `ProviderError(kind=connection, retryable=False,
+     message="redirect response not allowed", status_code=...)`; single
+     attempt, no follow (DESIGN §6.8).
+   - Other non-2xx → `ProviderError.from_status` with message from
+     `error.message` (dict), else body text; body read capped (req. 4);
+     message key-scrubbed per requirement 1.
    - 2xx: JSON parse failure / missing `choices[0].message` →
      `invalid_response`. `content` string → use; list → concatenate
      `part["text"]` for `part["type"] == "text"` (missing text key →
@@ -57,9 +65,10 @@ boundary B4.
 5. Retry (DESIGN §6.8): at most one retry, only when the mapped error has
    `retryable=True`; sleep = `Retry-After` seconds when the header parses as
    a number (cap 30) else `2 + random.uniform(0, 1)`; `asyncio.sleep`. No
-   retry on timeout (`httpx.TimeoutException` → `ProviderError(timeout,
-   retryable=False)` directly). Connection errors
-   (`httpx.TransportError`) → `connection`, retryable.
+   retry on timeout: catch `httpx.TimeoutException` **before**
+   `httpx.TransportError` (it is a subclass) → `ProviderError(timeout,
+   retryable=False)` directly. Other `httpx.TransportError` → `connection`,
+   retryable (one retry). Redirect responses are non-retryable per req. 3.
 6. `check()` (DESIGN §10.4): `complete(CompletionRequest(system_prompt=None,
    user_prompt="ping", temperature=None, top_p=None, max_tokens=1))` →
    `CheckResult(ok=True, message=f"ok ({latency_ms} ms)")`; on ProviderError
@@ -74,20 +83,32 @@ boundary B4.
 MockTransport tests, each asserting behavior AND (where relevant) the outgoing
 request:
 
-- [ ] Happy path: full body → result fields exact; auth header present;
-      system message included/excluded correctly; params omitted when None.
-- [ ] Loopback keyless config sends no Authorization header.
+- [ ] Happy path: full body → result fields exact; system message
+      included/excluded correctly; params omitted when None.
+- [ ] Application-header contract asserted on the captured request: keyed
+      config sends exactly `Authorization: Bearer …` + `Content-Type:
+      application/json` + `User-Agent: mybench/{version}` as
+      application-set headers; loopback keyless config sends no
+      `Authorization`; no OpenRouter attribution headers (`HTTP-Referer`,
+      `X-Title`) are ever sent (v1 rule, research §3).
+- [ ] Key scrubbing: error body echoing `Bearer sk-test-123` → resulting
+      `ProviderError.message` contains `[REDACTED]` and not the key.
 - [ ] Content as parts array → concatenated; part without `text` →
       invalid_response.
 - [ ] Missing `usage` → tokens None; partial usage → partial None.
 - [ ] 401 → auth, non-retryable, message from `error.message`.
 - [ ] 429 with `Retry-After: 0` → one retry then success (2 requests
       recorded); 429 twice → rate_limit error after exactly 2 attempts.
-- [ ] 500 then 200 → success; 400 → api_error, single attempt.
-- [ ] Redirect (301) → connection error, no follow (single request).
-- [ ] Timeout → timeout error, single attempt.
-- [ ] 6 MB body → content_too_large (both via Content-Length and via chunked
-      stream without Content-Length).
+- [ ] 500 then 200 → success (2 requests); 400 → api_error, single attempt.
+- [ ] Connection error then 200 → success (2 requests); two connection
+      errors → `connection` error after exactly 2 attempts.
+- [ ] Redirect (301) → connection error, non-retryable, single request.
+- [ ] Timeout → timeout error, single attempt (no retry).
+- [ ] Size cap: (a) `Content-Length: 6MB` → `content_too_large` without the
+      stream being read (custom transport that fails the test if its stream
+      is consumed); (b) chunked stream without Content-Length aborts once
+      past 5 MB; (c) oversized non-2xx error body → error raised with at
+      most 5 MB read.
 - [ ] Invalid JSON 2xx → invalid_response; empty content → invalid_response.
 - [ ] Error body with ANSI escapes → message stripped (via base ctor).
 - [ ] `check()` ok and failure paths.
@@ -95,7 +116,15 @@ request:
 
 ## Validation
 
-`uv run pytest tests/test_openai_compat.py -q`. Manual (optional, documented
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
+
+`uv run pytest tests/test_openai_compat.py -q`. optional manual QA (non-gating) (optional, documented
 in PR if run): one real call against Ollama or OpenRouter.
 
 ## Dependencies

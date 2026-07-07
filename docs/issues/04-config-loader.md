@@ -31,11 +31,20 @@ gate that keeps key material out of files.
      `enabled_models -> tuple[ModelConfig, ...]` (file order preserved) and
      `model_by_id(model_id) -> ModelConfig | None`.
 2. `load(path: Path | None = None) -> Config`:
-   - `path=None` → use `paths.config_path()`.
+   - `path=None` → use `paths.config_path()`; explicit paths normalized with
+     `Path(path).expanduser().resolve(strict=False)` (must not require
+     existence).
    - Missing file → `Config(Settings(), (), source_path=resolved_path)` (no
      error; commands needing models produce their own guidance — DESIGN §5.3).
    - Unreadable file or TOML syntax error → raise `ConfigError` (subclass of
      `Exception`, message prefixed `config error: `).
+   - Document-shape validation before field rules: only `settings` (table)
+     and `models` (array of tables) allowed at top level (unknown top-level
+     key → error naming it); wrong container types (e.g. `models` not an
+     array, `[settings]` not a table) → error; per-model required keys
+     (`id`, `provider`) missing → `models[N].id: required` style errors;
+     wrong scalar types (e.g. `enabled = "yes"`, `port = "8137"`) → error
+     naming field and expected type.
 3. Validation (raise `ConfigError` listing **all** violations, one per line,
    each prefixed with the TOML location like `models[2].id`):
    - Every rule in the DESIGN §5.3 table, including: id regex + uniqueness;
@@ -52,20 +61,28 @@ gate that keeps key material out of files.
      `models[N].api_key: storing keys in config is not supported; set
      api_key_env to the name of an environment variable instead`.
 4. Env var **values** are not read here (lazy at provider build; DESIGN §5.3).
-5. Anthropic default base_url `https://api.anthropic.com` is **not** filled in
-   here; leave `None` (adapter default, issue 12) — keeps config round-trip
-   faithful.
-6. mypy-strict clean; no dependencies beyond stdlib (`tomllib`).
+5. Anthropic `base_url` omitted → **normalized to
+   `https://api.anthropic.com` at load time** (DESIGN §5.3), so adapters and
+   snapshots always see a concrete URL.
+6. Error-message hygiene (DESIGN §5.3, §13.6): messages contain the TOML
+   location and the violated rule only — never the raw value of
+   secret-adjacent fields (`api_key`, `api_key_env`). Example: the `api_key`
+   error names the key and the fix, not the pasted value.
+7. mypy-strict clean; no dependencies beyond stdlib (`tomllib`).
 
 ## Acceptance Criteria
 
 - [ ] Valid example config from DESIGN §5.2 loads; `enabled_models` order
       matches file order.
-- [ ] Table-driven tests cover every §5.3 rule with at least one invalid case
-      each (≥ 15 invalid fixtures), asserting the offending location string
-      appears in the message.
+- [ ] Table-driven tests cover every §5.3 rule plus every document-shape rule
+      of requirement 2 with at least one invalid case each (≥ 20 invalid
+      fixtures), asserting the offending location string appears.
 - [ ] Multiple violations are reported together in one raise.
-- [ ] `api_key` literal produces the exact guidance message above.
+- [ ] `api_key` literal produces the exact guidance message above, and a
+      fixture with `api_key = "sk-canary-123"` produces an error message NOT
+      containing `sk-canary-123`.
+- [ ] Anthropic model with omitted base_url loads with
+      `base_url == "https://api.anthropic.com"`.
 - [ ] `http://192.168.1.10:11434/v1` rejected; `http://127.0.0.1:11434/v1`
       accepted; `https://` non-loopback accepted.
 - [ ] Missing file returns empty-models Config; malformed TOML raises
@@ -73,6 +90,14 @@ gate that keeps key material out of files.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_config.py -q`; manual load of the §5.2 example via
 `python -c`.

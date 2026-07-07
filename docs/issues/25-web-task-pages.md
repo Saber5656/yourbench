@@ -29,12 +29,18 @@ POST handler is issue 26 — this issue renders the form; 26 consumes it.
    `title`, `category` (text input, placeholder `general`), `system_prompt`
    (textarea), `user_prompt` (textarea, required), `temperature`, `top_p`,
    `max_tokens` (number inputs, blank = unset), `csrf_token` hidden.
-3. `POST /tasks` (CSRF-protected via issue 22's dependency):
-   - Parse blanks → None; numbers parsed leniently (`"0.7"` ok; junk →
-     validation message, not 500).
-   - Call `tasks.create`; on `ValueError` re-render `task_form.html` with
-     status 400, field values preserved, violations listed in a `.banner`
-     (DESIGN §11.2 note on form errors).
+3. `POST /tasks` (CSRF-protected via `Depends(csrf_protect)`, issue 22):
+   - Normalization (exact): strip all fields; `title`/`system_prompt` empty
+     → `None`; `category` empty → `"general"`; numeric fields empty →
+     `None`, else parse (`float` for temperature/top_p, `int` for
+     max_tokens) — unparsable value adds violation `"{field}: must be a
+     number"` instead of raising.
+   - Validation-first flow: run `safety.validate_task_params(...)` (issue 06
+     contract) plus the parse violations; any violations → re-render
+     `task_form.html` with status 400, field values preserved, ordered
+     violations listed in a `.banner`, nothing persisted. Only when clean →
+     `tasks.create` (its own `ValueError` is a defensive 400 via the same
+     re-render).
    - Success → 303 `/tasks/{id}`.
 4. `GET /tasks/{id}`:
    - Full prompt display: system + user prompts rendered via
@@ -42,13 +48,17 @@ POST handler is issue 26 — this issue renders the form; 26 consumes it.
      `escape_pre` (user text is semi-trusted but rendered like model text —
      one pipeline, DESIGN §12).
    - Params table (only non-None); created/archived stamps; runs-of-task
-     table (status, succeeded/total, votable badge, created, link).
+     table via `runs.list_runs(conn, task_id=id)` (issue 08's
+     `RunListItem`: status, `succeeded/total`, votable badge from
+     `.votable`, created, link to `/runs/{id}`).
    - Run trigger form (rendered here, handled by issue 26):
      `POST /tasks/{id}/runs`, checkbox per **enabled** config model
      (name `models`, value = model id; disabled models not listed), optional
      override inputs `temperature`, `top_p`, `max_tokens`, `csrf_token`.
-     When fewer than 2 enabled models exist, render the explanation + link
-     to docs instead of the form.
+     When fewer than 2 enabled models exist, render exactly the text
+     `at least 2 enabled models are required to run a comparison — edit
+     your config and run 'mybench models check'` instead of the form (no
+     external links).
    - Archive/unarchive button (`POST /tasks/{id}/archive` / `.../unarchive`,
      CSRF) with archived state banner; archived tasks show no run form.
    - 404 for unknown id via issue 22 error page.
@@ -61,27 +71,40 @@ POST handler is issue 26 — this issue renders the form; 26 consumes it.
 TestClient:
 
 - [ ] List filters/badges/empty state (fixtures); XSS title escaped.
-- [ ] Create happy path → 303, row exists; blank-to-None handling verified
-      (empty `max_tokens` string → NULL params).
+- [ ] Create happy path → 303, row exists; normalization verified (empty
+      strings → None/general; `"0.7"` parses; empty `max_tokens` → NULL).
 - [ ] Create with junk number / oversized prompt / bad category → 400
-      re-render, values preserved, all violations listed, nothing persisted.
-- [ ] Create without CSRF → 403 (reuses shared helper).
+      re-render, values preserved, all violations listed in order, nothing
+      persisted (task count unchanged).
+- [ ] Create without CSRF token / with bad Origin → 403, nothing persisted.
 - [ ] Detail: prompt with `<script>` markdown renders sanitized (no
-      `<script` in body); raw details block present; params table only
-      non-None; runs table correct.
-- [ ] Run form lists exactly enabled models; <2 enabled → no form, guidance
-      shown; archived task → no form.
+      `<script` in body); raw details block present (escaped); params table
+      only non-None; runs table matches a `RunListItem` fixture incl.
+      votable badge.
+- [ ] Run form lists exactly enabled models; <2 enabled → no form, the exact
+      guidance text shown; archived task → no form.
 - [ ] Archive→unarchive round-trip via POSTs (with CSRF) reflected in UI.
+- [ ] `tests.helpers.assert_secure_response(resp, html=True)` passes on all
+      three pages (list/form/detail), which also enforces no inline
+      script/style/handlers in the new templates.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_web_tasks.py -q`; manual create-and-browse with
 fake config.
 
 ## Dependencies
 
-07, 22, 23.
+07, 08 (`runs.list_runs` for the runs-of-task table), 22, 23.
 
 ## Non-goals
 

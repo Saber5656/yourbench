@@ -25,51 +25,59 @@ target). Consumes `votes.games()` (09) and `fit_bradley_terry` (14).
 1. `bootstrap.py`: `def bootstrap_ci(games: Sequence[Game], *,
    samples: int = 200, seed: int | None = None, confidence: float = 0.95)
    -> dict[str, tuple[int, int]]` per DESIGN §9.5:
-   - `samples == 0` or `len(games) == 0` → `{}`.
+   - Parameter validation: `samples < 0` or not `0 < confidence < 1` →
+     `ValueError`. `samples == 0` or `len(games) == 0` → `{}`.
    - `rng = random.Random(seed)`; resample `len(games)` games with
-     replacement; refit (`fit_bradley_terry` defaults) + display-scale per
-     resample (components recomputed per resample); models absent from a
-     resample are skipped for that sample.
-   - Per model with ≥ 1 sampled rating: percentile interval
-     (`(1±confidence)/2` quantiles, linear interpolation), ints.
-2. `leaderboard.py`: implement `LeaderboardRow` and `Leaderboard` exactly per
-   DESIGN §9.6, and
+     replacement; refit (`fit_bradley_terry` defaults) + components +
+     display scale per resample (issue 14's `connected_components` /
+     `to_display_ratings`); models absent from a resample are skipped for
+     that sample.
+   - Per model with ≥ 1 sampled rating: the DESIGN §9.5 percentile
+     algorithm verbatim (sorted values, `k = q*(n-1)`, linear interpolation,
+     `int(round(v))`); `n == 1` → that value for both bounds.
+2. `leaderboard.py`: implement `LeaderboardRow` and `Leaderboard` **exactly**
+   as the DESIGN §9.6 dataclasses (field names/types normative;
+   `unrated_models` sorted lexically), and
    `def compute_leaderboard(conn, *, category: str | None = None,
    include_nonblind: bool = False, bootstrap_samples: int = 200,
-   seed: int | None = None) -> Leaderboard`:
+   seed: int | None = None, known_model_ids: Sequence[str] | None = None)
+   -> Leaderboard`:
    - games via `votes.games(conn, category=..., include_nonblind=...)`.
-   - fit + components + display ratings via issue 14; CIs via bootstrap.
-   - Per-model tallies from the games list using `Game.kind` (DESIGN §9.1):
-     `games` count, fractional `wins`,
-     `win_rate = decisive_wins / decisive_games` (`None` when no decisive
-     games), `tie_rate = tie games / games`,
-     `both_bad_rate = both_bad games / games`.
+   - fit via issue 14's `fit_bradley_terry`; components via
+     `connected_components`; display ratings via `to_display_ratings`;
+     CIs via `bootstrap_ci`.
+   - Per-model tallies from the games list using `Game.kind` (DESIGN §9.1).
+     For model m: `games(m)` = games where m participates; `wins(m)` = sum
+     of m's scores (`score_lo` when m is `model_lo`, else `1 - score_lo`);
+     `decisive_games(m)` = games with `kind == "decisive"` involving m;
+     `decisive_wins(m)` = decisive games m won (score 1.0);
+     `win_rate = decisive_wins / decisive_games` (`None` when 0 decisive);
+     `tie_rate = kind=="tie" games / games(m)`;
+     `both_bad_rate = kind=="both_bad" games / games(m)`.
    - `provisional = games < 10`; `component` index per DESIGN §9.6; rows
      sorted rating desc within component, components ordered by size desc
-     then min model id; `unrated_models` = configured-but-gameless is NOT
-     known here (config-free layer) — instead `unrated_models` = models
-     appearing only in non-eligible votes is impossible by construction, so
-     the field is filled by callers? **No** — keep DESIGN contract: this
-     function takes `known_model_ids: Sequence[str] | None = None`; when
-     provided (callers pass config model ids), models with zero games are
-     listed in `unrated_models`.
-   - `total_votes` = number of games before regularization.
-3. Performance test (marked `slow`, excluded from default run, run in CI):
-   synthetic 5,000 games / 15 models / samples=200 completes in < 2 s
-   (DESIGN §9.5; assert < 4 s in CI to absorb runner variance, log the
-   measured time).
-4. mypy-strict clean; stdlib only.
+     then min model id; `known_model_ids` (callers pass config model ids)
+     yields `unrated_models` = ids with zero games, sorted.
+   - `total_votes` = number of games after filters, before regularization.
+3. Performance test, marked `slow` but included in the default pytest run
+   (it completes in seconds; no CI-workflow change needed): synthetic 5,000
+   games / 15 models / samples=200. Assert `< 4 s` (runner-variance guard,
+   DESIGN §9.5) and print the measured time; a measured local value above
+   2 s must be reported in the PR as a Known Unknown U4 trigger, not
+   silently absorbed.
+4. mypy-strict clean; no third-party imports.
 
 ## Acceptance Criteria
 
-- [ ] Deterministic: same seed → identical CIs; different seed → (almost
-      surely) different; `samples=0` → no CIs and `ci_low/ci_high = None` in
-      rows.
+- [ ] Deterministic: same seed → identical CIs (run twice); `samples=0` →
+      no CIs and `ci_low/ci_high = None` in rows; `samples=-1` /
+      `confidence=1.5` → `ValueError`.
 - [ ] CI sanity: for a lopsided fixture (A beats B 20-0), A's `ci_low` >
       B's `ci_high`.
-- [ ] Rates: hand-built fixture with 2 decisive + 1 tie + 1 both_bad per pair
-      verifies `win_rate`/`tie_rate`/`both_bad_rate` arithmetic and
-      `total_votes`.
+- [ ] Rates: fixture A-vs-B with A winning 2 decisive, 1 tie, 1 both_bad →
+      A: games 4, wins 3.0, win_rate 1.0, tie_rate 0.25, both_bad_rate 0.25;
+      B: games 4, wins 1.0, win_rate 0.0, same rates; `total_votes == 4`
+      (exact expected table asserted).
 - [ ] Blind filter: non-blind votes excluded by default, included with flag
       (fixture from issue 09 semantics).
 - [ ] Category filter verified via games() passthrough.
@@ -80,6 +88,14 @@ target). Consumes `votes.games()` (09) and `fit_bradley_terry` (14).
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_bootstrap.py tests/test_leaderboard.py -q` and the
 `slow` perf test via `uv run pytest -m slow -q`.

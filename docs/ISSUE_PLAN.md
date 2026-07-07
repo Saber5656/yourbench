@@ -42,8 +42,8 @@ DESIGN.md; no DESIGN.md v1 behavior is missing from issues (coverage table §5).
 | 10 | `issues/10-provider-interface-fake.md` | Provider interface, error taxonomy, registry, fake provider | 2 | 04 |
 | 11 | `issues/11-openai-compat-provider.md` | OpenAI-compatible provider adapter | 2 | 10 |
 | 12 | `issues/12-anthropic-provider.md` | Anthropic provider adapter | 2 | 10 |
-| 13 | `issues/13-run-engine.md` | Run execution engine | 2 | 04, 08, 10 |
-| 14 | `issues/14-bradley-terry-core.md` | Bradley-Terry MM estimator with regularization and components | 3 | 01 |
+| 13 | `issues/13-run-engine.md` | Run execution engine | 2 | 04, 06, 08, 10 |
+| 14 | `issues/14-bradley-terry-core.md` | Bradley-Terry MM estimator with regularization and components | 3 | 01, 09 |
 | 15 | `issues/15-leaderboard-assembly.md` | Bootstrap CIs and leaderboard assembly | 3 | 09, 14 |
 | 16 | `issues/16-cli-skeleton-init.md` | CLI skeleton: group, logging/redaction wiring, init/config/version | 4 | 04, 05, 06 |
 | 17 | `issues/17-cli-models-commands.md` | CLI: models list / models check | 4 | 10, 16 |
@@ -51,14 +51,14 @@ DESIGN.md; no DESIGN.md v1 behavior is missing from issues (coverage table §5).
 | 19 | `issues/19-cli-run-command.md` | CLI: run | 4 | 13, 16 |
 | 20 | `issues/20-export-module.md` | Export module (JSON/CSV, 0600, no-overwrite) | 4 | 07, 08, 09 |
 | 21 | `issues/21-cli-leaderboard-export.md` | CLI: leaderboard / export commands | 4 | 15, 16, 20 |
-| 22 | `issues/22-web-core-security.md` | Web core: app factory, security middleware, base templates, serve cmd | 5 | 04, 05, 06, 16 |
+| 22 | `issues/22-web-core-security.md` | Web core: app factory, security middleware, base templates, serve cmd | 5 | 04, 05, 06, 08, 16 |
 | 23 | `issues/23-markdown-sanitizer.md` | Markdown rendering + sanitization pipeline | 5 | 01 |
 | 24 | `issues/24-web-dashboard.md` | Web: dashboard page | 5 | 09, 22 |
-| 25 | `issues/25-web-task-pages.md` | Web: task list/create/detail/archive pages | 5 | 07, 22, 23 |
-| 26 | `issues/26-web-run-pages.md` | Web: run trigger, run detail w/ blindness rules, status polling, reveal | 5 | 08, 13, 22, 23 |
+| 25 | `issues/25-web-task-pages.md` | Web: task list/create/detail/archive pages | 5 | 07, 08, 22, 23 |
+| 26 | `issues/26-web-run-pages.md` | Web: run trigger, run detail w/ blindness rules, status polling, reveal | 5 | 08, 09, 13, 22, 23, 25 |
 | 27 | `issues/27-web-vote-page.md` | Web: blind voting page + vote POST + reveal banner | 5 | 09, 22, 23 |
 | 28 | `issues/28-web-leaderboard-page.md` | Web: leaderboard page | 5 | 15, 22 |
-| 29 | `issues/29-web-history-pages.md` | Web: runs list, votes history, vote delete | 5 | 08, 09, 22, 23 |
+| 29 | `issues/29-web-history-pages.md` | Web: runs list, votes history, vote delete | 5 | 08, 09, 22 |
 | 30 | `issues/30-e2e-suite.md` | End-to-end test suite over CLI + web with fake provider | 6 | 16–19, 21, 22–29 |
 | 31 | `issues/31-packaging-release-readiness.md` | Packaging polish: README, CHANGELOG, LICENSE, wheel smoke test | 6 | 30 |
 | 32 | `issues/32-security-acceptance-sweep.md` | Security acceptance sweep: verify every §13 control | 6 | 30 |
@@ -93,10 +93,10 @@ flowchart LR
     I01 --> I02 & I03 & I04 & I05 & I06 & I14 & I23
     I03 --> I04 & I05
     I05 --> I07 & I08 & I09
-    I06 --> I07 & I16 & I22
+    I06 --> I07 & I13 & I16 & I22
     I07 --> I09 & I18 & I20 & I25
-    I08 --> I09 & I13 & I20 & I26 & I29
-    I09 --> I15 & I20 & I24 & I27 & I29
+    I08 --> I09 & I13 & I20 & I22 & I25 & I26 & I29
+    I09 --> I14 & I15 & I20 & I24 & I26 & I27 & I29
     I04 --> I10 & I13 & I16 & I22
     I10 --> I11 & I12 & I13 & I17
     I13 --> I19 & I26
@@ -105,7 +105,8 @@ flowchart LR
     I16 --> I17 & I18 & I19 & I21 & I22
     I20 --> I21
     I22 --> I24 & I25 & I26 & I27 & I28 & I29
-    I23 --> I25 & I26 & I27 & I29
+    I23 --> I25 & I26 & I27
+    I25 --> I26
     W4 --> I30
     W5 --> I30
     I30 --> I31 & I32

@@ -23,19 +23,25 @@ automatically (ADR-003).
 ## Detailed Requirements
 
 1. `GET /runs`:
-   - `runs.list_runs(conn, limit=50)` table: run id (link), task display
-     title (link to task), category, status, `succeeded/total` (+ `failed`
-     count when > 0), votable badge, blind/revealed badge, created.
-   - Filter `?task={id}` passthrough to the repo; header shows the task
-     scope with a clear-filter link.
+   - `runs.list_runs(conn, limit=50)` (issue 08's `RunListItem` — this
+     issue adds no repo SQL) table: run id (link), task display title (link
+     to task), category, **models** (`model_ids` joined by `, ` — ids only,
+     no mapping to content; DESIGN §11.2), status, `succeeded/total`
+     (+ `failed` count when > 0), votable badge, blind/revealed badge,
+     created.
+   - Filter `?task={id}`: non-integer value → 400 error page; integer but
+     nonexistent task → 404; valid → passthrough to the repo, header shows
+     the task scope with a clear-filter link.
    - Empty state message.
 2. `GET /votes`:
-   - `votes.list_votes(conn, limit=100)` table: vote id, created, task title
-     (link), category, `model_a` vs `model_b` (models ARE shown — the vote
-     already happened; §8.5 does not apply retroactively), outcome rendered
-     as the winning model id / `tie` / `both bad`, blind badge (`non-blind`
-     highlighted), note (plain autoescaped text, truncated 80 with full text
-     in `title` attribute), delete button.
+   - `votes.list_votes(conn, limit=100)` (issue 09's `VoteListItem` — no
+     new repo SQL) table: vote id, created, task title (link), category,
+     `model_a` vs `model_b` (models ARE shown — the vote already happened;
+     §8.5 does not apply retroactively), outcome rendered as the winning
+     model id / `tie` / `both bad`, blind badge (`non-blind` highlighted),
+     note (scalar metadata → plain autoescaped text per DESIGN §12,
+     truncated 80 with full text in the `title` attribute — attribute
+     context is autoescaped by Jinja too), delete button.
    - Delete button: inline form `POST /votes/{id}/delete` with CSRF +
      `onsubmit`-free confirm: v1 uses a plain submit (no JS confirm — CSP
      forbids inline handlers; an accidental delete is recoverable only by
@@ -44,37 +50,48 @@ automatically (ADR-003).
    - Empty state message.
 3. `POST /votes/{id}/delete` (CSRF): `votes.delete`; missing id → 404;
    success → 303 `/votes`.
-4. Both pages: no model output content is rendered here (lists only) — no
-   `markdown_safe` needed; all text autoescaped; notes are user text
-   (autoescape suffices, consistent with §12 which mandates the pipeline for
-   *rendered-as-markdown* content only — notes are shown as plain text).
+4. Both pages: no content bodies are rendered here (lists only), so
+   `web.render` is not imported; all text is scalar metadata under the
+   DESIGN §12 policy (Jinja autoescape).
 5. mypy-strict clean.
 
 ## Acceptance Criteria
 
 TestClient:
 
-- [ ] Runs list fixture renders counts/badges/links; task filter works;
-      newest first; limit respected.
+- [ ] Runs list fixture renders models column (ids only), counts, badges,
+      links; newest first; limit respected; `?task=` matrix: valid filter
+      works with clear-filter link, non-int → 400, unknown int → 404.
 - [ ] Votes list renders all outcome variants (a/b/tie/both_bad), blind vs
       non-blind badges, truncated note with full title attr; XSS note
-      appears escaped.
-- [ ] Delete: CSRF-less POST → 403; valid POST removes the row → 303; the
-      pair becomes least-voted again (next `/vote` GET serves it — cross-
-      check with issue 09 scheduling); missing id → 404.
-- [ ] Deleting a vote changes the leaderboard on next request (integration
-      assertion via compute_leaderboard before/after).
-- [ ] Security helper assertions pass on both pages.
+      appears escaped in both text and attribute contexts.
+- [ ] Delete: CSRF-less/bad-Origin POST → 403 and row still present; valid
+      POST removes the row → 303; repo-level assertion that the deleted
+      pair's vote count dropped (`votes.unvoted_pair_count` +1 for a
+      fixture where that pair was the only voted one); missing id → 404.
+- [ ] Deleting a vote shrinks `votes.games(conn)` by exactly one game
+      (before/after assertion — rating-level effects are covered by
+      ADR-003 recomputation and issue 30).
+- [ ] `tests.helpers.assert_secure_response(resp, html=True)` passes on
+      `/runs` and `/votes`.
 - [ ] ruff, mypy strict, pytest green.
 
 ## Validation
+
+All per-issue gates (DESIGN §17) must pass:
+
+```sh
+uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest -q
+```
+
+Targeted checks:
 
 `uv run pytest tests/test_web_history.py -q`; manual browse-and-delete pass.
 
 ## Dependencies
 
-08, 09, 22, 23 (23 nominally — only if any content rendering sneaks in;
-otherwise autoescape only).
+08, 09, 22. (23 is not a dependency: these pages render scalar metadata
+only, per DESIGN §12.)
 
 ## Non-goals
 
